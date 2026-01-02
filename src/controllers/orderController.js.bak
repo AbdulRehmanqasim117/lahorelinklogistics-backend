@@ -1,0 +1,780 @@
+const Order = require('../models/Order');
+const CommissionConfig = require('../models/CommissionConfig');
+const FinancialTransaction = require('../models/FinancialTransaction');
+const RiderProfile = require('../models/RiderProfile');
+const generateBookingId = require('../config/bookingId');
+const generateTrackingId = require('../config/trackingId');
+const QRCode = require('qrcode');
+
+exports.createOrder = async (req, res, next) => {
+  try {
+    const {
+      consigneeName, consigneePhone, consigneeAddress, destinationCity,
+      serviceType, codAmount, productDescription, pieces, fragile, remarks, paymentType,
+      weight, weightCategory
+    } = req.body;
+
+    // Validate weight and weightCategory
+    if (!weight || weight <= 0) {
+      return res.status(400).json({ message: 'Weight must be greater than 0' });
+    }
+
+    const validCategories = ["0-1kg", "1-3kg", "3-5kg", "5kg+"];
+    if (!weightCategory || !validCategories.includes(weightCategory)) {
+      return res.status(400).json({ 
+        message: 'Invalid weight category. Must be one of: ' + validCategories.join(', ')
+      });
+    }
+
+    const bookingId = await generateBookingId();
+    const trackingId = await generateTrackingId();
+
+    const constantShipperId = process.env.DEFAULT_SHIPPER_ID;
+    const shipperIdToUse = constantShipperId && constantShipperId.length >= 10 ? constantShipperId : req.user.id;
+
+    // Get commission config for the shipper
+    const commissionConfig = await CommissionConfig.findOne({ shipper: shipperIdToUse });
+    
+    // Calculate service charges from CommissionConfig if set, else fallback
+    if (commissionConfig) {
+      if (commissionConfig.type === 'PERCENTAGE') {
+        serviceCharges = Math.round(Number(codAmount || 0) * (commissionConfig.value / 100));
+      } else {
+        serviceCharges = commissionConfig.value;
+      }
+    } else {
+      serviceCharges = 0;
+    }
+
+    const orderData = {
+      bookingId,
+      trackingId,
+      shipper: shipperIdToUse,
+      consigneeName,
+      consigneePhone,
+      consigneeAddress,
+      destinationCity,
+      serviceType,
+      paymentType: paymentType || (Number(codAmount) > 0 ? 'COD' : 'ADVANCE'),
+      codAmount: paymentType === 'ADVANCE' ? 0 : Number(codAmount || 0),
+      productDescription,
+      pieces,
+      fragile,
+      weight: Number(weight),
+      weightCategory,
+      serviceCharges,
+      totalAmount: (paymentType === 'ADVANCE' ? 0 : Number(codAmount || 0)) + serviceCharges,
+      remarks,
+      status: 'CREATED',
+      statusHistory: [{
+        status: 'CREATED',
+        updatedBy: req.user.id,
+        note: 'Order created by shipper'
+      }],
+      // Set integration flags
+      isIntegrated: req.body.isIntegrated || false,
+      bookingState: req.body.isIntegrated ? 'UNBOOKED' : 'BOOKED'
+    };
+
+    const order = new Order(orderData);
+
+    const savedOrder = await order.save();
+    res.status(201).json(savedOrder);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getOrders = async (req, res, next) => {
+  try {
+    const { role, id } = req.user;
+    const { status, from, to, q } = req.query;
+
+    let query = {};
+
+    // Role-based filtering
+    if (role === 'SHIPPER') {
+      // Shipper sees all their orders (both integrated and manual)
+      query.shipper = id;
+    } else if (role === 'RIDER') {
+      // Riders only see assigned orders that are booked
+      query.assignedRider = id;
+      query.bookingState = 'BOOKED';
+    } else if (['CEO', 'MANAGER'].includes(role)) {
+      // CEO and MANAGER only see booked orders (both integrated and manual)
+      query.$or = [
+        { isIntegrated: { $ne: true } }, // all non-integrated/manual orders
+        { isIntegrated: true, bookingState: 'BOOKED' } // integrated but booked
+      ];
+    }
+
+    // Optional Filters
+    if (status) {
+      query.status = status;
+    }
+
+    if (from || to) {
+      query.createdAt = {};
+      if (from) query.createdAt.$gte = new Date(from);
+      if (to) query.createdAt.$lte = new Date(to);
+    }
+
+    if (q && q.trim()) {
+      const id = q.trim();
+      query.$or = [
+        { bookingId: id },
+        { trackingId: id }
+      ];
+    }
+
+    const orders = await Order.find(query)
+      .populate('shipper', 'name email companyName')
+      .populate('assignedRider', 'name phone')
+      .sort({ createdAt: -1 });
+
+    res.json(orders);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getManagerOverview = async (req, res, next) => {
+  try {
+    const start = new Date();
+    start.setHours(0,0,0,0);
+    const end = new Date();
+    end.setHours(23,59,59,999);
+
+    const todayReceived = await Order.countDocuments({ createdAt: { $gte: start, $lte: end } });
+    const todayBooked = await Order.countDocuments({ createdAt: { $gte: start, $lte: end }, assignedRider: { $ne: null } });
+    const todayUnbooked = await Order.countDocuments({ createdAt: { $gte: start, $lte: end }, assignedRider: null });
+
+    const warehouseCount = await Order.countDocuments({ status: 'ASSIGNED' });
+    const outForDeliveryCount = await Order.countDocuments({ status: 'OUT_FOR_DELIVERY' });
+    const returnedCount = await Order.countDocuments({ status: 'RETURNED' });
+
+    const pendingReviewCountAgg = await require('../models/FinancialTransaction').countDocuments({ settlementStatus: 'PENDING' });
+
+    res.json({
+      todayReceived,
+      todayBooked,
+      todayUnbooked,
+      warehouseCount,
+      outForDeliveryCount,
+      returnedCount,
+      deliveryUnderReviewCount: pendingReviewCountAgg
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getOrderById = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const order = await Order.findById(id)
+      .populate('shipper', 'name email')
+      .populate('assignedRider', 'name phone');
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+
+    const userId = req.user.id;
+    const role = req.user.role;
+    if (role === 'SHIPPER' && order.shipper._id.toString() !== userId) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+    const assignedId = typeof order.assignedRider === 'object' && order.assignedRider !== null
+      ? order.assignedRider._id?.toString()
+      : order.assignedRider?.toString();
+    if (role === 'RIDER' && assignedId !== userId) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+
+    res.json(order);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const assignRider = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { riderId } = req.body;
+
+    const order = await Order.findById(id);
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    const previousRider = order.assignedRider;
+    order.assignedRider = riderId || null;
+
+    // Auto-update status to ASSIGNED if currently CREATED
+    if (riderId && order.status === 'CREATED') {
+      order.status = 'ASSIGNED';
+    }
+
+    // Add history
+    order.statusHistory.push({
+      status: order.status,
+      updatedBy: req.user.id,
+      note: riderId 
+        ? `Assigned to rider ${riderId}` 
+        : `Unassigned from rider ${previousRider}`
+    });
+
+    await order.save();
+    
+    // Return populated order
+    const updatedOrder = await Order.findById(id)
+      .populate('shipper', 'name')
+      .populate('assignedRider', 'name');
+
+    res.json(updatedOrder);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.updateStatus = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { status, amountCollected, reason } = req.body;
+    
+    const order = await Order.findById(id);
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    // Validation
+    const validStatuses = [
+      "OUT_FOR_DELIVERY",
+      "DELIVERED",
+      "RETURNED",
+      "FAILED",
+      "FIRST_ATTEMPT",
+      "SECOND_ATTEMPT",
+      "THIRD_ATTEMPT"
+    ];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ message: 'Invalid status for update' });
+    }
+
+    const previousStatus = order.status;
+    order.status = status;
+
+    if (status === 'DELIVERED') {
+      order.deliveredAt = Date.now();
+      const parsed = Number(amountCollected);
+      if (!isNaN(parsed) && parsed >= 0) {
+        order.amountCollected = parsed;
+      } else {
+        order.amountCollected = order.codAmount;
+      }
+    } else if (status === 'FAILED' || status === 'RETURNED') {
+      order.failedReason = reason;
+    }
+
+    order.statusHistory.push({
+      status: status,
+      updatedBy: req.user.id,
+      note: reason || `Status updated to ${status}`
+    });
+
+    await order.save();
+
+    if (["DELIVERED", "RETURNED", "FAILED"].includes(status) && previousStatus !== status) {
+      await createFinancialTransaction(order);
+      
+      // Update rider finance when order is completed
+      if (order.assignedRider && status === 'DELIVERED') {
+        await updateRiderFinance(order);
+      }
+    }
+
+    res.json(order);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const createFinancialTransaction = async (order) => {
+  try {
+    const existing = await FinancialTransaction.findOne({ order: order._id });
+
+    const isDelivered = order.status === 'DELIVERED';
+    const cod = isDelivered ? (order.amountCollected || order.codAmount || 0) : 0;
+
+    const config = await CommissionConfig.findOne({ shipper: order.shipper });
+    let companyCommission = 0;
+    if (isDelivered && config) {
+      if (config.type === 'PERCENTAGE') {
+        companyCommission = (cod * config.value) / 100;
+      } else {
+        companyCommission = config.value;
+      }
+    }
+
+    let riderCommission = 0;
+    if (order.assignedRider) {
+      const riderCfgModel = require('../models/RiderCommissionConfig');
+      const riderCfg = await riderCfgModel.findOne({ rider: order.assignedRider });
+      if (riderCfg) {
+        let rule;
+        if (Array.isArray(riderCfg.rules) && riderCfg.rules.length) {
+          rule = riderCfg.rules.find(r => r.status === order.status);
+        }
+        if (rule) {
+          if (rule.type === 'PERCENTAGE') {
+            riderCommission = (cod * rule.value) / 100;
+          } else {
+            riderCommission = rule.value;
+          }
+        } else if (riderCfg.type && riderCfg.value !== undefined) {
+          if (riderCfg.type === 'PERCENTAGE') {
+            riderCommission = (cod * riderCfg.value) / 100;
+          } else {
+            riderCommission = riderCfg.value;
+          }
+        }
+      }
+    }
+
+    companyCommission = Math.min(companyCommission, cod);
+    riderCommission = Math.min(riderCommission, cod);
+    const shipperShare = cod - companyCommission;
+
+    const payload = {
+      order: order._id,
+      shipper: order.shipper,
+      rider: order.assignedRider,
+      totalCodCollected: cod,
+      shipperShare: shipperShare,
+      companyCommission: companyCommission,
+      riderCommission: riderCommission,
+      settlementStatus: 'PENDING'
+    };
+
+    if (existing) {
+      await FinancialTransaction.updateOne({ _id: existing._id }, payload);
+    } else {
+      await FinancialTransaction.create(payload);
+    }
+  } catch (err) {
+    console.error("Error creating financial transaction:", err);
+    // Don't throw here, to avoid failing the status update response
+  }
+};
+
+const updateRiderFinance = async (order) => {
+  try {
+    if (!order.assignedRider) return;
+    
+    const riderProfile = await RiderProfile.findOne({ user: order.assignedRider });
+    if (!riderProfile) {
+      // Create profile if it doesn't exist
+      await RiderProfile.create({
+        user: order.assignedRider,
+        codCollected: order.amountCollected || order.codAmount || 0,
+        serviceCharges: order.serviceCharges || 0,
+        serviceChargeStatus: 'unpaid'
+      });
+      return;
+    }
+    
+    // Only update if service charges are unpaid
+    if (riderProfile.serviceChargeStatus === 'unpaid') {
+      riderProfile.codCollected += (order.amountCollected || order.codAmount || 0);
+      riderProfile.serviceCharges += (order.serviceCharges || 0);
+      await riderProfile.save();
+    } else {
+      // If paid, only update COD collected
+      riderProfile.codCollected += (order.amountCollected || order.codAmount || 0);
+      await riderProfile.save();
+    }
+  } catch (err) {
+    console.error("Error updating rider finance:", err);
+    // Don't throw here, to avoid failing the status update response
+  }
+};
+
+exports.getLabel = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    
+    const order = await Order.findById(id).populate('shipper', 'name companyName');
+    
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    // Check permissions
+    const userId = req.user.id;
+    const role = req.user.role;
+
+    if (role === 'SHIPPER' && order.shipper._id.toString() !== userId) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+    if (role === 'RIDER' && order.assignedRider?.toString() !== userId) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+
+    // Construct label payload
+  const labelData = {
+      bookingId: order.bookingId,
+      trackingId: order.trackingId,
+      consignee: {
+        name: order.consigneeName,
+        phone: order.consigneePhone,
+        address: order.consigneeAddress,
+        destinationCity: order.destinationCity
+      },
+      shipper: {
+        name: order.shipper.name,
+        companyName: order.shipper.companyName || 'N/A', // Assuming populating from User might not have profile fields directly without aggregation, but standard User model doesn't have companyName. 
+        // Note: companyName is in ShipperProfile. For simplicity, we are returning User name here. 
+        // In a real prod app, you'd populate from ShipperProfile.
+        serviceType: order.serviceType
+      },
+      order: {
+        codAmount: order.codAmount,
+        paymentType: order.paymentType,
+        productDescription: order.productDescription,
+        pieces: order.pieces,
+        fragile: order.fragile,
+        createdAt: order.createdAt
+      }
+    };
+
+    res.json(labelData);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getLabels = async (req, res, next) => {
+  try {
+    const { ids } = req.query;
+    if (!ids) return res.status(400).json({ message: 'ids query is required' });
+    const idList = ids.split(',').map(s => s.trim()).filter(Boolean);
+    if (idList.length === 0) return res.status(400).json({ message: 'No ids provided' });
+
+    // Fetch orders
+    const orders = await Order.find({ _id: { $in: idList } }).populate('shipper', 'name companyName').lean();
+    if (!orders || orders.length === 0) return res.status(404).json({ message: 'Orders not found' });
+
+    // Permissions per role
+    const userId = req.user.id;
+    const role = req.user.role;
+    const permitted = orders.filter(order => {
+      if (role === 'SHIPPER') return order.shipper && String(order.shipper._id || order.shipper) === userId;
+      if (role === 'RIDER') return String(order.assignedRider || '') === userId;
+      return true; // MANAGER/CEO
+    });
+
+    const labels = permitted.map(order => ({
+      bookingId: order.bookingId,
+      trackingId: order.trackingId,
+      consignee: {
+        name: order.consigneeName,
+        phone: order.consigneePhone,
+        address: order.consigneeAddress,
+        destinationCity: order.destinationCity
+      },
+      shipper: {
+        name: order.shipper?.name || 'N/A',
+        companyName: order.shipper?.companyName || 'N/A',
+        serviceType: order.serviceType
+      },
+      order: {
+        codAmount: order.codAmount,
+        paymentType: order.paymentType,
+        productDescription: order.productDescription,
+        pieces: order.pieces,
+        fragile: order.fragile,
+        createdAt: order.createdAt
+      }
+    }));
+
+    res.json({ count: labels.length, labels });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Return printable HTML for selected labels (SHIPPER only)
+exports.printLabelsHtml = async (req, res, next) => {
+  try {
+    const shipperId = req.user.id;
+    const ids = Array.isArray(req.body.orderIds) ? req.body.orderIds : [];
+    if (!ids.length) return res.status(400).send('No orderIds provided');
+
+    const orders = await Order.find({ _id: { $in: ids }, shipper: shipperId })
+      .populate('shipper', 'name companyName')
+      .lean();
+    if (!orders.length) return res.status(404).send('Orders not found');
+
+    const patterns = {
+      '0': '101001101101', '1': '110100101011', '2': '101100101011', '3': '110110010101',
+      '4': '101001101011', '5': '110100110101', '6': '101100110101', '7': '101001011011',
+      '8': '110100101101', '9': '101100101101', '*': '100101101101'
+    };
+    const barcodeSvg = (val) => {
+      const text = `*${String(val).toUpperCase()}*`;
+      let seq = '';
+      for (const ch of text) { seq += (patterns[ch] || patterns['0']) + '0'; }
+      let x = 0; const barWidth = 1; const height = 35; const rects = [];
+      for (const bit of seq) { if (bit === '1') rects.push(`<rect x="${x}" y="0" width="${barWidth}" height="${height}" fill="#000" />`); x += barWidth; }
+      return `<svg width="180" height="${height}" viewBox="0 0 ${x} ${height}" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" style="max-width: 100%; height: auto;">${rects.join('')}</svg>`;
+    };
+
+    // Build labels with QR codes (data URLs) so they render in print HTML
+    const labelsWithQr = await Promise.all(orders.map(async (o) => {
+      const cod = Number(o.codAmount || 0).toLocaleString();
+      const codAmount = Number(o.codAmount || 0);
+      const created = new Date(o.createdAt).toISOString().split('T')[0];
+      const trackingBarcode = barcodeSvg(String(o.trackingId || '').replace(/[^0-9]/g, ''));
+      const orderBarcode = barcodeSvg(String(o.bookingId || '').replace(/[^0-9]/g, ''));
+      const codBarcode = barcodeSvg(String(codAmount).replace(/[^0-9]/g, ''));
+      const shipperName = o.shipper?.name || 'N/A';
+      const shipperAddress = o.shipper?.address || o.shipper?.companyName || 'N/A';
+      const shipperPhone = o.shipper?.phone || 'N/A';
+      const service = o.paymentType || o.serviceType || 'COD';
+      const weight = o.weight || '0.5 KG';
+      const fragile = o.fragile ? 'true' : 'false';
+      const pieces = o.pieces || 1;
+      const remarks = o.remarks || (o.fragile ? 'FRAGILE - Handle with care' : 'Allow to open in front of rider');
+      const products = o.productDescription || 'N/A';
+      const qrContent = `LLL|${o.bookingId || ''}`;
+      const qrDataUrl = await QRCode.toDataURL(qrContent, { margin: 0, width: 90 });
+      const logoUrl = `/logo.png`;
+      return {
+        html: `
+      <div class="label-card">
+        <div class="top-section">
+          <div class="grid-cols-12">
+            <div class="col-4">
+              <div class="section-header">Customer Information</div>
+              <div class="section-content">
+                <div class="info-row"><span class="label">Name:</span> <span class="value">${o.consigneeName}</span></div>
+                <div class="info-row"><span class="label">Phone:</span> <span class="value">${o.consigneePhone}</span></div>
+                <div class="info-row"><span class="label">Address:</span> <span>${o.consigneeAddress}</span></div>
+                <div class="divider"></div>
+                <div class="destination">Destination: ${o.destinationCity}</div>
+                <div class="divider"></div>
+                <div class="order-row">
+                  <span class="order-label">Order: ${o.bookingId}</span>
+                  <div class="barcode-container">${orderBarcode}</div>
+                </div>
+              </div>
+            </div>
+            <div class="col-4">
+              <div class="section-header">Brand Information</div>
+              <div class="section-content">
+                <div class="info-row-flex">
+                  <span class="label">Shipper: ${shipperName}</span>
+                  <span class="value">${shipperPhone}</span>
+                </div>
+                <div class="info-row"><span class="label">Shipper Address:</span> <span>${shipperAddress}</span></div>
+              </div>
+              <div class="amount-box">
+                <div class="amount-label">Amount</div>
+                <div class="amount-value">Rs ${cod}</div>
+                <div class="barcode-container">${codBarcode}</div>
+              </div>
+            </div>
+            <div class="col-4">
+              <div class="section-header">Parcel Information</div>
+              <div class="logo-section">
+                <div class="logo-container">
+                  <img src="${logoUrl}" alt="LahoreLink Logistics" class="logo-img" />
+                </div>
+                <div class="qr-box">
+                  <img src="${qrDataUrl}" alt="QR ${qrContent}" class="qr-img" />
+                  <div class="qr-caption">Scan to mark<br/>arrived at LLL warehouse</div>
+                </div>
+              </div>
+              <div class="tracking-barcode-container">
+                ${trackingBarcode}
+                <div class="tracking-id">${o.trackingId}</div>
+              </div>
+              <div class="parcel-details">
+                <div class="detail-row">Service: ${service}</div>
+                <div class="detail-grid">
+                  <div class="detail-cell">Date: ${created}</div>
+                  <div class="detail-cell-right">Weight: ${weight}</div>
+                </div>
+                <div class="detail-grid">
+                  <div class="detail-cell">Fragile: ${fragile}</div>
+                  <div class="detail-cell-right">Pieces: ${pieces}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="remarks-section">
+          <span class="remarks-label">Remarks:</span>
+          <span class="remarks-value">- ${remarks}</span>
+        </div>
+        <div class="products-section">
+          <span class="products-label">Products:</span>
+          <span class="products-value">[ ${pieces} x ${products} ]</span>
+        </div>
+      </div>
+        `
+      };
+    }));
+
+    const labelsHtml = labelsWithQr.map(l => l.html).join('');
+
+    const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Labels</title>
+  <style>
+    @page { size: A4 portrait; margin: 5mm; }
+    body { font-family: Arial, Helvetica, sans-serif; margin: 0; padding: 0; background: white; }
+    .wrap { max-width: 800px; margin: 0 auto; padding: 10px; }
+    .label-card { 
+      background: white; 
+      color: black; 
+      width: 100%; 
+      max-width: 800px; 
+      border: 2px solid #000; 
+      box-sizing: border-box; 
+      margin-bottom: 5px;
+      height: 93mm;
+      overflow: hidden;
+      page-break-inside: avoid;
+    }
+    .top-section { padding: 0; }
+    .grid-cols-12 { 
+      display: grid; 
+      grid-template-columns: 1fr 1fr 1fr; 
+      border-left: 2px solid #000;
+      border-right: 2px solid #000;
+    }
+    .col-4 { 
+      border-right: 2px solid #000; 
+      display: flex; 
+      flex-direction: column;
+    }
+    .col-4:last-child { border-right: none; }
+    .section-header { 
+      border-bottom: 2px solid #000; 
+      text-align: center; 
+      font-weight: bold; 
+      font-size: 12px; 
+      padding: 4px 2px;
+      text-transform: capitalize;
+    }
+    .section-content { 
+      padding: 4px; 
+      font-size: 9px; 
+      line-height: 1.2;
+      flex-grow: 1;
+    }
+    .info-row { margin: 2px 0; }
+    .info-row-flex { 
+      display: flex; 
+      justify-content: space-between; 
+      align-items: start; 
+      margin: 2px 0;
+      font-size: 9px;
+    }
+    .label { font-weight: bold; color: #666; margin-right: 4px; }
+    .value { font-weight: bold; }
+    .divider { border-top: 1px solid #000; margin: 4px 0; }
+    .destination { font-weight: bold; font-size: 10px; margin-top: 2px; }
+    .order-row { margin-top: 4px; }
+    .order-label { font-weight: bold; }
+    .barcode-container { 
+      margin: 2px 0; 
+      text-align: center; 
+      padding: 2px;
+      background: white;
+    }
+    .amount-box { 
+      border-top: 2px solid #000; 
+      flex-grow: 1; 
+      display: flex; 
+      flex-direction: column; 
+      align-items: center; 
+      justify-content: center; 
+      padding: 4px;
+    }
+    .amount-label { font-size: 8px; margin-bottom: 1px; }
+    .amount-value { font-weight: 900; font-size: 14px; margin-bottom: 2px; }
+    .logo-section { 
+      display: flex; 
+        align-items: center; 
+        justify-content: space-between; 
+      padding: 4px; 
+      border-bottom: 1px solid #000;
+    }
+    .logo-container { display: flex; align-items: center; }
+      .logo-img { height: 40px; width: auto; }
+      .qr-box { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+      .qr-img { width: 70px; height: 70px; object-fit: contain; }
+      .qr-caption { font-size: 7px; line-height: 1.1; text-align: center; }
+    .tracking-barcode-container { 
+      padding: 4px; 
+      display: flex; 
+      flex-direction: column; 
+      align-items: center; 
+      border-bottom: 1px solid #000;
+    }
+    .tracking-id { font-size: 8px; font-weight: bold; margin-top: 2px; }
+    .parcel-details { 
+      flex-grow: 1; 
+      font-size: 9px; 
+      font-weight: bold;
+    }
+    .detail-row { padding: 2px 4px; border-bottom: 1px solid #000; }
+    .detail-grid { 
+      display: grid; 
+      grid-template-columns: 1fr 1fr; 
+      border-bottom: 1px solid #000;
+    }
+    .detail-cell { padding: 2px 4px; border-right: 1px solid #000; }
+    .detail-cell-right { padding: 2px 4px; text-align: right; }
+    .remarks-section { 
+      border-top: 2px solid #000; 
+      padding: 2px 4px; 
+      font-size: 9px;
+    }
+    .remarks-label { font-weight: bold; margin-right: 4px; }
+    .remarks-value { font-weight: bold; }
+    .products-section { 
+      border-top: 2px solid #000; 
+      padding: 2px 4px; 
+      font-size: 9px; 
+      line-height: 1.2;
+    }
+    .products-label { font-weight: bold; margin-right: 4px; }
+    .products-value { }
+    @media print {
+      body { margin: 0; padding: 0; }
+      .wrap { padding: 0; max-width: 100%; }
+      .label-card { 
+        margin-bottom: 2mm; 
+        page-break-after: auto;
+        height: 93mm;
+      }
+      .label-card:last-child { page-break-after: auto; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root" class="wrap">
+    ${labelsHtml}
+  </div>
+</body>
+</html>`;
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.status(200).send(html);
+  } catch (error) {
+    next(error);
+  }
+};
