@@ -27,8 +27,13 @@ const CEO_PASSWORD = (process.env.CEO_PASSWORD || "").trim();
 const MANAGER_EMAIL = (process.env.MANAGER_EMAIL || "").trim();
 const MANAGER_PASSWORD = (process.env.MANAGER_PASSWORD || "").trim();
 
-if (!CEO_EMAIL || !CEO_PASSWORD || !MANAGER_EMAIL || !MANAGER_PASSWORD) {
-  throw new Error("CEO or Manager credentials missing in environment variables");
+const HAS_ADMIN_SEED_ENVS =
+  !!CEO_EMAIL && !!CEO_PASSWORD && !!MANAGER_EMAIL && !!MANAGER_PASSWORD;
+
+if (!HAS_ADMIN_SEED_ENVS) {
+  console.warn(
+    "CEO or Manager credentials missing in environment variables; admin accounts will not be auto-seeded",
+  );
 }
 
 // Connect to database
@@ -179,11 +184,17 @@ const trySeed = async () => {
 };
 
 dbReady.then((ok) => {
-  if (ok) {
-    trySeed();
-  } else {
+  if (!ok) {
     console.warn("Skipping seed: DB not connected");
+    return;
   }
+
+  if (!HAS_ADMIN_SEED_ENVS) {
+    console.warn("Skipping seed: admin env vars are not fully configured");
+    return;
+  }
+
+  trySeed();
 });
 
 module.exports = app;
