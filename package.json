@@ -7,10 +7,10 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "prisma:migrate": "prisma migrate dev --name init_mysql",
-    "prisma:generate": "prisma generate",
-    "prisma:deploy": "prisma migrate deploy",
+    "prisma:generate": "node node_modules/prisma/build/index.js generate",
+    "prisma:deploy": "node node_modules/prisma/build/index.js migrate deploy",
     "build": "npm run prisma:generate",
-    "postinstall": "npm run prisma:generate && npm run prisma:deploy"
+    "postinstall": "npm run prisma:generate"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
