@@ -1,0 +1,561 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// --- Enums ---
+
+enum UserRole {
+  CEO
+  MANAGER
+  SHIPPER
+  RIDER
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum OrderStatus {
+  CREATED
+  ASSIGNED
+  AT_LLL_WAREHOUSE
+  OUT_FOR_DELIVERY
+  DELIVERED
+  RETURNED
+  FAILED
+  FIRST_ATTEMPT
+  SECOND_ATTEMPT
+  THIRD_ATTEMPT
+}
+
+enum PaymentType {
+  COD
+  ADVANCE
+}
+
+enum ServiceType {
+  SAME_DAY
+  OVERNIGHT
+  ECONOMY
+}
+
+enum FinancePeriodStatus {
+  OPEN
+  CLOSED
+}
+
+enum LedgerEntryType {
+  ORDER
+  PAYOUT
+  ADJUSTMENT
+}
+
+enum LedgerEntryStatus {
+  PAID
+  UNPAID
+}
+
+enum IntegrationProvider {
+  SHOPIFY
+  WOOCOMMERCE
+  CUSTOM
+}
+
+enum IntegratedBookingStatus {
+  NOT_BOOKED
+  BOOKED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  FINALIZED
+  PAID
+}
+
+enum NotificationType {
+  PICKUP_REQUEST
+  ORDER_UPDATE
+  SYSTEM
+}
+
+// --- Core Identity ---
+
+model User {
+  id                  Int        @id @default(autoincrement())
+  name                String
+  email               String     @unique
+  phone               String?    @db.VarChar(50)
+  passwordHash        String
+  role                UserRole
+  status              UserStatus @default(ACTIVE)
+
+  resetPasswordToken  String?
+  resetPasswordCode   String?
+  resetPasswordExpires DateTime?
+
+  // Shipper fields
+  companyName         String?
+  cnicNumber          String?
+  contactNumber       String?
+  emergencyContact    String?
+  pickupAddress       String?
+  bankAccountDetails  String?
+  bankName            String?
+  accountHolderName   String?
+  accountNumber       String?
+  iban                String?
+
+  // Generic CNIC
+  cnic                String?
+
+  // Rider specific
+  vehicleType         String?
+  vehicleNumber       String?
+  vehicleModel        String?
+
+  // Commission flags for shipper
+  commissionStatus    String?    @db.VarChar(20)
+  commissionRate      Float?     @db.Float
+  commissionType      String?    @db.VarChar(20)
+  commissionValue     Float?     @db.Float
+  isCommissionApproved Boolean?  @default(false)
+  approvedBy          Int?
+  approvedAt          DateTime?
+
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+
+  // Relations
+  shipperProfile      ShipperProfile?
+  riderProfile        RiderProfile?
+
+  ordersShipped       Order[]    @relation("OrdersShipper")
+  ordersRidden        Order[]    @relation("OrdersRider")
+
+  financialTransactionsShipper FinancialTransaction[] @relation("TxShipper")
+  financialTransactionsRider   FinancialTransaction[] @relation("TxRider")
+
+  shipperLedgers      ShipperLedgerEntry[]
+
+  financePeriodsClosed FinancePeriod[] @relation("FinancePeriodClosedBy")
+
+  invoicesCreated     Invoice[]  @relation("InvoiceCreatedBy")
+  invoicesForShipper  Invoice[]  @relation("InvoiceShipper")
+
+  // Order audit relations
+  weightVerifiedOrders    Order[]         @relation("WeightVerifiedBy")
+  warehouseReceivedOrders Order[]         @relation("WarehouseReceivedBy")
+  orderEventsCreated      OrderEvent[]    @relation("OrderEventCreatedBy")
+
+  // Finance relations
+  financialTransactionsPaid FinancialTransaction[] @relation("FinancialTransactionPaidBy")
+
+  // Integrated orders relations
+  integratedOrders          IntegratedOrder[] @relation("IntegratedOrder_Shipper")
+  integratedOrdersBooked    IntegratedOrder[] @relation("IntegratedOrder_BookedBy")
+
+  // External order links
+  externalOrderLinks        ExternalOrderLink[] @relation("ExternalOrderLinkShipper")
+
+  integrations        IntegrationConfig?
+  shipperIntegrationConfig ShipperIntegrationConfig?
+  shipperIntegrations  ShipperIntegration[]
+
+  notifications       Notification[] @relation("NotificationShipper")
+}
+
+model ShipperProfile {
+  id                Int    @id @default(autoincrement())
+  userId            Int    @unique
+  companyName       String
+  address           String?
+  defaultServiceTypes Json?
+
+  user              User   @relation(fields: [userId], references: [id])
+}
+
+model RiderProfile {
+  id                Int    @id @default(autoincrement())
+  userId            Int    @unique
+  vehicleInfo       String?
+  codCollected      Float  @default(0)
+  serviceCharges    Float  @default(0)
+  serviceChargeStatus String @default("unpaid")
+
+  user              User   @relation(fields: [userId], references: [id])
+}
+
+// --- Orders ---
+
+model Order {
+  id                 Int          @id @default(autoincrement())
+  bookingId          String       @unique
+  trackingId         String       @unique
+
+  shipperId          Int
+  assignedRiderId    Int?
+
+  externalOrderId    String?      @db.VarChar(100)
+
+  consigneeName      String
+  consigneePhone     String
+  consigneeAddress   String
+  destinationCity    String
+
+  serviceType        ServiceType
+  paymentType        PaymentType  @default(COD)
+  codAmount          Float        @default(0)
+  productDescription String?
+  pieces             Int          @default(1)
+  fragile            Boolean      @default(false)
+
+  weightKg           Float
+  weightOriginalKg   Float?
+  weightVerifiedById Int?
+  weightVerifiedAt   DateTime?
+  weightSource       String?      @db.VarChar(30)
+
+  remarks            String?
+
+  status             OrderStatus  @default(CREATED)
+
+  deliveredAt        DateTime?
+  outForDeliveryAt   DateTime?
+  amountCollected    Float?
+  failedReason       String?
+
+  serviceCharges     Float        @default(0)
+  serviceChargesWeightUsed Float?
+  serviceChargesBracketMin Float?
+  serviceChargesBracketMax Float?
+  serviceChargesRate Float?
+  serviceChargesCalculatedAt DateTime?
+
+  totalAmount        Float        @default(0)
+
+  invoiceId          Int?
+  invoicedAt         DateTime?
+
+  warehouseReceivedAt DateTime?
+  warehouseReceivedById Int?
+
+  isIntegrated       Boolean      @default(false)
+  bookingState       String       @default("BOOKED")
+  bookedWithLLL      Boolean      @default(false)
+  isDeleted          Boolean      @default(false)
+  shipperApprovalStatus String    @default("approved")
+
+  source             String?
+  sourceShopDomain   String?
+  sourceProviderOrderId String?
+  sourceProviderOrderNumber String?
+
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  shipper            User         @relation("OrdersShipper", fields: [shipperId], references: [id])
+  assignedRider      User?        @relation("OrdersRider", fields: [assignedRiderId], references: [id])
+
+  invoice            Invoice?     @relation("InvoiceOrders", fields: [invoiceId], references: [id])
+
+  weightVerifiedBy   User?        @relation("WeightVerifiedBy", fields: [weightVerifiedById], references: [id])
+  warehouseReceivedBy User?       @relation("WarehouseReceivedBy", fields: [warehouseReceivedById], references: [id])
+
+  statusEvents       OrderEvent[]
+  financialTransaction FinancialTransaction?
+  ledgerEntries      ShipperLedgerEntry[]
+  integratedOrdersLll IntegratedOrder[] @relation("IntegratedOrder_LllOrder")
+  externalOrderLinks ExternalOrderLink[]
+}
+
+model OrderEvent {
+  id          Int        @id @default(autoincrement())
+  orderId     Int
+  status      String
+  note        String?
+  createdById Int?
+  createdAt   DateTime   @default(now())
+
+  order       Order      @relation(fields: [orderId], references: [id])
+  createdBy   User?      @relation("OrderEventCreatedBy", fields: [createdById], references: [id])
+}
+
+// --- Finance ---
+
+model FinancialTransaction {
+  id               Int      @id @default(autoincrement())
+  orderId          Int      @unique
+  shipperId        Int
+  riderId          Int?
+
+  totalCodCollected Float
+  shipperShare     Float
+  companyCommission Float
+  riderCommission   Float   @default(0)
+
+  settlementStatus  String  @default("UNPAID")
+  paidAt            DateTime?
+  paidById          Int?
+  settlementBatchId String?
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  order             Order    @relation(fields: [orderId], references: [id])
+  shipper           User     @relation("TxShipper", fields: [shipperId], references: [id])
+  rider             User?    @relation("TxRider", fields: [riderId], references: [id])
+  paidBy            User?    @relation("FinancialTransactionPaidBy", fields: [paidById], references: [id])
+}
+
+model ShipperLedgerEntry {
+  id            Int               @id @default(autoincrement())
+  shipperId     Int
+  orderId       Int?
+  bookingId     String?
+
+  entryDate     DateTime
+  type          LedgerEntryType
+  particular    String?
+
+  codAmount     Float?
+  serviceCharges Float?
+  riderPaid     Float?
+  companyProfit Float?
+  weightKg      Float?
+  receivable    Float?
+  amount        Float
+  status        LedgerEntryStatus @default(UNPAID)
+  notes         String?
+
+  periodId      Int?
+
+  createdBy     String?           @default("system")
+
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  shipper       User              @relation(fields: [shipperId], references: [id])
+  order         Order?            @relation(fields: [orderId], references: [id])
+  period        FinancePeriod?    @relation(fields: [periodId], references: [id])
+}
+
+model FinancePeriod {
+  id          Int               @id @default(autoincrement())
+  periodStart DateTime
+  periodEnd   DateTime?
+  status      FinancePeriodStatus @default(OPEN)
+  closedAt    DateTime?
+  closedById  Int?
+
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  closedBy    User?             @relation("FinancePeriodClosedBy", fields: [closedById], references: [id])
+  ledgerEntries ShipperLedgerEntry[]
+}
+
+// --- Invoices ---
+
+model Invoice {
+  id                 Int       @id @default(autoincrement())
+  invoiceNumber      String    @unique
+
+  shipperId          Int
+  accountName        String
+  accountNumber      String?
+  invoiceDate        DateTime
+  parcelFrom         DateTime
+  parcelTo           DateTime
+
+  codTotal           Float      @default(0)
+  flyerChargesTotal  Float      @default(0)
+  serviceChargesTotal Float     @default(0)
+  fuelCharges        Float      @default(0)
+  otherCharges       Float      @default(0)
+  discount           Float      @default(0)
+  whtIt              Float      @default(0)
+  whtSt              Float      @default(0)
+  netPayable         Float
+
+  createdById        Int
+  status             InvoiceStatus @default(FINALIZED)
+
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+
+  shipper             User       @relation("InvoiceShipper", fields: [shipperId], references: [id])
+  createdBy           User       @relation("InvoiceCreatedBy", fields: [createdById], references: [id])
+
+  orders              Order[]    @relation("InvoiceOrders")
+}
+
+// --- Integrations & Webhooks ---
+
+model IntegrationConfig {
+  id        Int    @id @default(autoincrement())
+  shipperId Int    @unique
+  apiKey    String @unique
+  enabled   Boolean @default(false)
+  providers Json?
+
+  shipper   User   @relation(fields: [shipperId], references: [id])
+}
+
+model ShipperIntegrationConfig {
+  id        Int    @id @default(autoincrement())
+  shipperId Int    @unique
+  enabled   Boolean @default(false)
+  apiKey    String?
+  providers Json?
+
+  shipper   User   @relation(fields: [shipperId], references: [id])
+}
+
+model ShipperIntegration {
+  id           Int              @id @default(autoincrement())
+  shipperId    Int
+  provider     IntegrationProvider @default(SHOPIFY)
+  shopDomain   String
+  accessToken  String?
+  scopes       Json?
+  installedAt  DateTime?
+  status       String           @default("active")
+  webhookVersion String?
+
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  shipper      User             @relation(fields: [shipperId], references: [id])
+
+  @@unique([shipperId, provider, shopDomain])
+}
+
+model IntegratedOrder {
+  id                  Int                 @id @default(autoincrement())
+  shipperId           Int
+  provider            IntegrationProvider @default(SHOPIFY)
+  shopDomain          String
+  providerOrderId     String
+  providerOrderNumber String?
+  rawPayload          Json?
+
+  customerName        String?
+  phone               String?
+  address             String?
+  city                String?
+
+  itemsSummary        String?
+  totalPrice          Float?
+  currency            String?
+
+  financialStatus     String?
+  fulfillmentStatus   String?
+
+  createdAtProvider   DateTime?
+  importedAt          DateTime            @default(now())
+
+  lllBookingStatus    IntegratedBookingStatus @default(NOT_BOOKED)
+  bookedAt            DateTime?
+  bookedById          Int?
+  lllOrderId          Int?
+
+  tags                Json?
+  notes               String?
+
+  lastWebhookId       String?
+  lastWebhookAt       DateTime?
+  lastPayloadHash     String?
+  webhookDeliveryCount Int                 @default(0)
+
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  shipper             User                @relation("IntegratedOrder_Shipper", fields: [shipperId], references: [id])
+  bookedBy            User?               @relation("IntegratedOrder_BookedBy", fields: [bookedById], references: [id])
+  lllOrder            Order?              @relation("IntegratedOrder_LllOrder", fields: [lllOrderId], references: [id])
+
+  @@unique([shipperId, provider, shopDomain, providerOrderId])
+}
+
+model ExternalOrderLink {
+  id               Int      @id @default(autoincrement())
+  provider         IntegrationProvider
+  externalOrderId  String
+  shipperId        Int
+  lahorelinkOrderId Int
+
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  shipper          User     @relation("ExternalOrderLinkShipper", fields: [shipperId], references: [id])
+  lahorelinkOrder  Order    @relation(fields: [lahorelinkOrderId], references: [id])
+
+  @@unique([provider, externalOrderId, shipperId])
+}
+
+model WebhookLog {
+  id              Int       @id @default(autoincrement())
+  provider        IntegrationProvider
+  topic           String?
+  shopDomain      String?
+  webhookId       String?
+  statusCode      Int?
+  errorMessage    String?
+  payload         Json?
+  createdAt       DateTime  @default(now())
+}
+
+// --- Notifications & Company Profile ---
+
+model Notification {
+  id                 Int           @id @default(autoincrement())
+  type               NotificationType
+  shipperId          Int?
+  message            String
+  totalPendingParcels Int        @default(0)
+  read               Boolean      @default(false)
+  readAt             DateTime?
+  metadata           Json?
+
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  shipper            User?        @relation("NotificationShipper", fields: [shipperId], references: [id])
+}
+
+model CompanyProfile {
+  id            Int      @id @default(autoincrement())
+  companyName   String   @default("LahoreLink Courier Services")
+  logoUrl       String?  @default("")
+  addressLine1  String   @default("Office # 123, Main Boulevard, Gulberg III")
+  addressCity   String   @default("Lahore")
+  addressCountry String  @default("Pakistan")
+  phone         String   @default("+92-42-111-LINK (5465)")
+  alternatePhone String? @default("")
+  email         String   @default("finance@lahorelink.com")
+  website       String   @default("www.lahorelink.com")
+  ntn           String?  @default("")
+  strn          String?  @default("")
+  footerNote    String   @default("For support contact: +92-42-111-LINK (5465) | Email: support@lahorelink.com")
+  isActive      Boolean  @default(true)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// --- Generic Counters ---
+
+model Counter {
+  id        Int     @id @default(autoincrement())
+  key       String  @unique
+  seq       Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

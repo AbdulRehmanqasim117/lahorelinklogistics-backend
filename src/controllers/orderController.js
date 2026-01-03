@@ -64,7 +64,9 @@ const createOrder = async (req, res, next) => {
         status: 'CREATED', updatedBy: req.user.id, note: 'Order created by shipper'
       }],
       isIntegrated: false,
-      bookingState: 'BOOKED'
+      bookingState: 'BOOKED',
+      source: 'MANUAL',
+      bookedWithLLL: true
     };
 
     const order = new Order(orderData);

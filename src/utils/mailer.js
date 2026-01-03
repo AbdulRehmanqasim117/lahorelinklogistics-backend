@@ -1,5 +1,7 @@
 const nodemailer = require('nodemailer');
-const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
+const CLIENT_URL =
+  (process.env.FRONTEND_URL || process.env.CLIENT_URL || 'https://lahorelinklogistics.com')
+    .replace(/\/$/, '');
 
 // Read SMTP configuration from environment variables
 // Example (for Gmail with App Password):

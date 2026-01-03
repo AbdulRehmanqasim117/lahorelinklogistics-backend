@@ -5,6 +5,7 @@ const integrationAuth = require('../middleware/integrationAuth');
 const auth = require('../middleware/auth');
 const requireRole = require('../middleware/requireRole');
 const requireCommissionApproved = require('../middleware/requireCommissionApproved');
+const shopifyIntegrationController = require('../controllers/shopifyIntegrationController');
 
 // External systems (API key based)
 router.post('/:provider/orders', integrationAuth, integrationController.createFromProvider);
@@ -30,6 +31,32 @@ router.post(
   requireRole('SHIPPER'),
   requireCommissionApproved,
   integrationController.regenerateKey,
+);
+
+// Shopify: connect store (shopDomain, access token, scopes)
+router.post(
+  '/shopify/connect',
+  auth,
+  requireRole('SHIPPER'),
+  requireCommissionApproved,
+  shopifyIntegrationController.connectStore,
+);
+
+// Shopify integrated orders (JWT, shipper-facing)
+router.get(
+  '/shopify/orders',
+  auth,
+  requireRole('SHIPPER'),
+  requireCommissionApproved,
+  shopifyIntegrationController.listShipperIntegratedOrders,
+);
+
+router.post(
+  '/shopify/orders/:integratedOrderId/book',
+  auth,
+  requireRole('SHIPPER'),
+  requireCommissionApproved,
+  shopifyIntegrationController.bookIntegratedOrder,
 );
 
 module.exports = router;

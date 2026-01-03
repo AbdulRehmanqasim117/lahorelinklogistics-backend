@@ -7,6 +7,10 @@ const { OAuth2Client } = require('google-auth-library');
 const { google } = require('googleapis');
 const CommissionConfig = require('../models/CommissionConfig');
 
+// Centralized backend URL helpers
+const API_BASE_URL = (process.env.API_BASE_URL || process.env.API_URL || process.env.SERVER_URL || '').replace(/\/$/, '');
+const FRONTEND_URL = (process.env.FRONTEND_URL || process.env.CLIENT_URL || '').replace(/\/$/, '');
+
 exports.login = async (req, res, next) => {
   try {
     const { email, password } = req.body;
@@ -312,8 +316,8 @@ exports.resetPassword = async (req, res, next) => {
 // Google sign-in (server-side redirect flow)
 exports.googleAuthStart = (req, res) => {
   const clientId = process.env.GOOGLE_CLIENT_ID;
-  const redirect = process.env.GOOGLE_REDIRECT_URL || `${process.env.SERVER_URL || ''}/api/auth/google/callback`;
-  if (!clientId) return res.status(500).send('Google OAuth not configured');
+  const redirect = process.env.GOOGLE_REDIRECT_URL || (API_BASE_URL ? `${API_BASE_URL}/api/auth/google/callback` : '');
+  if (!clientId || !redirect) return res.status(500).send('Google OAuth not configured');
   const params = new URLSearchParams({
     client_id: clientId,
     redirect_uri: redirect,
@@ -415,7 +419,7 @@ exports.googleAuthCallback = async (req, res, next) => {
     const oauth2Client = new OAuth2Client(
       process.env.GOOGLE_CLIENT_ID,
       process.env.GOOGLE_CLIENT_SECRET,
-      `${process.env.API_URL}/api/auth/google/callback`
+      process.env.GOOGLE_REDIRECT_URL || (API_BASE_URL ? `${API_BASE_URL}/api/auth/google/callback` : undefined)
     );
 
     const { tokens } = await oauth2Client.getToken(code);
@@ -459,10 +463,10 @@ exports.googleAuthCallback = async (req, res, next) => {
     });
 
     // Redirect to frontend with token in URL for clients that need it
-    res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${token}`);
+    res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`);
   } catch (error) {
     console.error('Google auth callback error:', error);
-    res.redirect(`${process.env.FRONTEND_URL}/login?error=google_auth_failed`);
+    res.redirect(`${FRONTEND_URL}/login?error=google_auth_failed`);
   }
 };
 

@@ -137,6 +137,11 @@ const orderSchema = new mongoose.Schema(
       enum: ["UNBOOKED", "BOOKED"],
       default: "BOOKED", // for normal/manual orders
     },
+    bookedWithLLL: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
     isDeleted: {
       type: Boolean,
       default: false,
@@ -147,6 +152,11 @@ const orderSchema = new mongoose.Schema(
     },
     source: {
       type: String,
+    },
+    sourceMeta: {
+      shopDomain: { type: String },
+      providerOrderId: { type: String },
+      providerOrderNumber: { type: String },
     },
   },
   {
