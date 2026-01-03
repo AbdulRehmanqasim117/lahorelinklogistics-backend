@@ -9,7 +9,7 @@
     "prisma:migrate": "prisma migrate dev --name init_mysql",
     "prisma:generate": "node node_modules/prisma/build/index.js generate",
     "prisma:deploy": "node node_modules/prisma/build/index.js migrate deploy",
-    "build": "npm run prisma:generate",
+    "build": "node -e \"const fs=require('fs');try{fs.mkdirSync('build',{recursive:true});}catch(e){}\" && npm run prisma:generate",
     "postinstall": "npm run prisma:generate"
   },
   "dependencies": {
