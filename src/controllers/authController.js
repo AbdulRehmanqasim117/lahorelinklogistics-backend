@@ -1,11 +1,10 @@
-const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { sendResetEmail } = require('../utils/mailer');
 const { OAuth2Client } = require('google-auth-library');
 const { google } = require('googleapis');
-const CommissionConfig = require('../models/CommissionConfig');
+const prisma = require('../prismaClient');
 
 // Centralized backend URL helpers
 const API_BASE_URL = (process.env.API_BASE_URL || process.env.API_URL || process.env.SERVER_URL || '').replace(/\/$/, '');
@@ -20,8 +19,8 @@ exports.login = async (req, res, next) => {
       return res.status(400).json({ message: 'Please provide email and password' });
     }
 
-    // Check for user
-    const user = await User.findOne({ email });
+    // Check for user in MySQL via Prisma
+    const user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
@@ -40,7 +39,7 @@ exports.login = async (req, res, next) => {
     const secret = process.env.JWT_SECRET || 'dev_secret_key';
     const expiresIn = process.env.JWT_EXPIRES_IN || '30d'; // 30 days
     const token = jwt.sign(
-      { id: user._id, role: user.role, name: user.name, email: user.email },
+      { id: user.id, role: user.role, name: user.name, email: user.email },
       secret,
       { expiresIn }
     );
@@ -60,7 +59,7 @@ exports.login = async (req, res, next) => {
       role: user.role, 
       name: user.name,
       email: user.email,
-      id: user._id
+      id: user.id
     });
   } catch (error) {
     next(error);
@@ -95,7 +94,7 @@ exports.signup = async (req, res, next) => {
     if (!['SHIPPER', 'RIDER'].includes(role)) {
       return res.status(403).json({ message: 'Only Shipper or Rider can sign up' });
     }
-    const exists = await User.findOne({ email });
+    const exists = await prisma.user.findUnique({ where: { email } });
     if (exists) {
       return res.status(409).json({ message: 'Email already registered' });
     }
@@ -144,8 +143,9 @@ exports.signup = async (req, res, next) => {
         payload.vehicleModel = vehicleModel;
       }
     }
-    const user = await User.create(payload);
-    res.status(201).json({ id: user._id, role: user.role, name: user.name, email: user.email });
+
+    const user = await prisma.user.create({ data: payload });
+    res.status(201).json({ id: user.id, role: user.role, name: user.name, email: user.email });
   } catch (error) {
     next(error);
   }
@@ -155,39 +155,48 @@ exports.signup = async (req, res, next) => {
 // Used by the frontend AuthContext via GET /api/auth/me
 exports.me = async (req, res, next) => {
   try {
-    const userId = req.user?.id || req.user?._id;
+    const userId = req.user?.id;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized. Missing user in token.' });
     }
 
-    const user = await User.findById(userId).select('-passwordHash').lean();
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        commissionConfig: {
+          include: { weightBrackets: true },
+        },
+      },
+    });
+
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
+    const { passwordHash, commissionConfig, ...safeUser } = user;
+
+    let portalActive;
+    let weightBracketsCount = null;
+
     // For SHIPPER accounts, derive portalActive and weightBracketsCount from
     // commission configuration so the frontend can gate portal access.
     if (user.role === 'SHIPPER') {
-      try {
-        const cfg = await CommissionConfig.findOne({ shipper: user._id })
-          .select('weightBrackets')
-          .lean();
-
-        const count = Array.isArray(cfg?.weightBrackets)
-          ? cfg.weightBrackets.length
-          : 0;
-
-        user.weightBracketsCount = count;
-        user.portalActive = count > 0;
-      } catch (err) {
-        console.error('Error deriving shipper portal flags in /auth/me:', err);
-        user.weightBracketsCount = null;
-        user.portalActive = false;
-      }
+      const cfg = commissionConfig;
+      const brackets = cfg?.weightBrackets || [];
+      const hasBrackets = Array.isArray(brackets) && brackets.length > 0;
+      weightBracketsCount = hasBrackets ? brackets.length : 0;
+      portalActive = hasBrackets;
     }
 
-    res.json({ user });
+    const responseUser = {
+      _id: safeUser.id,
+      ...safeUser,
+      ...(portalActive !== undefined ? { portalActive } : {}),
+      ...(weightBracketsCount !== null ? { weightBracketsCount } : {}),
+    };
+
+    res.json({ user: responseUser });
   } catch (error) {
     next(error);
   }
@@ -203,17 +212,21 @@ exports.forgotPassword = async (req, res, next) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ message: 'Email is required' });
-    
-    const user = await User.findOne({ email });
+
+    const user = await prisma.user.findUnique({ where: { email } });
     if (user) {
       // Generate a 6-digit verification code
       const verificationCode = generateVerificationCode();
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes from now
-      
+
       // Save the verification code and expiry
-      user.resetPasswordCode = verificationCode;
-      user.resetPasswordExpires = expiresAt;
-      await user.save();
+      await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          resetPasswordCode: verificationCode,
+          resetPasswordExpires: expiresAt,
+        },
+      });
 
       // Send verification code via email and log it for testing
       console.log('\n======================================');
@@ -236,7 +249,7 @@ exports.forgotPassword = async (req, res, next) => {
     res.status(200).json({ 
       message: 'If that email exists, a verification code has been sent to your email.',
       // In development, return the code for testing
-      ...(process.env.NODE_ENV !== 'production' && user ? { verificationCode: user.resetPasswordCode } : {})
+      ...(process.env.NODE_ENV !== 'production' && user ? { verificationCode } : {})
     });
   } catch (err) {
     next(err);
@@ -251,10 +264,12 @@ exports.verifyResetCode = async (req, res, next) => {
       return res.status(400).json({ message: 'Email and verification code are required' });
     }
 
-    const user = await User.findOne({
-      email,
-      resetPasswordCode: code,
-      resetPasswordExpires: { $gt: new Date() }
+    const user = await prisma.user.findFirst({
+      where: {
+        email,
+        resetPasswordCode: code,
+        resetPasswordExpires: { gt: new Date() },
+      },
     });
 
     if (!user) {
@@ -263,10 +278,14 @@ exports.verifyResetCode = async (req, res, next) => {
 
     // Generate a one-time token for password reset
     const resetToken = crypto.randomBytes(32).toString('hex');
-    user.resetPasswordToken = resetToken;
-    user.resetPasswordExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-    user.resetPasswordCode = undefined; // Clear the code after verification
-    await user.save();
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        resetPasswordToken: resetToken,
+        resetPasswordExpires: new Date(Date.now() + 10 * 60 * 1000),
+        resetPasswordCode: null,
+      },
+    });
 
     res.json({ 
       message: 'Verification successful',
@@ -291,9 +310,11 @@ exports.resetPassword = async (req, res, next) => {
     }
 
     // Find user by token and check expiration
-    const user = await User.findOne({
-      resetPasswordToken: token,
-      resetPasswordExpires: { $gt: new Date() }
+    const user = await prisma.user.findFirst({
+      where: {
+        resetPasswordToken: token,
+        resetPasswordExpires: { gt: new Date() },
+      },
     });
 
     if (!user) {
@@ -301,10 +322,14 @@ exports.resetPassword = async (req, res, next) => {
     }
 
     // Update password and clear reset token
-    user.passwordHash = await bcrypt.hash(password, 10);
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpires = undefined;
-    await user.save();
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        passwordHash: await bcrypt.hash(password, 10),
+        resetPasswordToken: null,
+        resetPasswordExpires: null,
+      },
+    });
 
     res.json({ message: 'Password has been reset successfully' });
   } catch (error) {
@@ -365,7 +390,7 @@ exports.googleAuth = async (req, res, next) => {
     const googleUser = await verifyGoogleToken(credential);
     
     // Find or create user
-    let user = await User.findOne({ email: googleUser.email });
+    let user = await prisma.user.findUnique({ where: { email: googleUser.email } });
     
     if (user) {
       // Existing user - check status
@@ -376,13 +401,15 @@ exports.googleAuth = async (req, res, next) => {
       }
     } else {
       // New user - create with default SHIPPER role
-      user = await User.create({
-        name: googleUser.name,
-        email: googleUser.email,
-        // Generate a random password that won't be used
-        passwordHash: crypto.randomBytes(32).toString('hex'),
-        role: 'SHIPPER',
-        status: 'ACTIVE'
+      user = await prisma.user.create({
+        data: {
+          name: googleUser.name,
+          email: googleUser.email,
+          // Generate a random password that won't be used
+          passwordHash: crypto.randomBytes(32).toString('hex'),
+          role: 'SHIPPER',
+          status: 'ACTIVE',
+        },
       });
     }
 
@@ -390,7 +417,7 @@ exports.googleAuth = async (req, res, next) => {
     const secret = process.env.JWT_SECRET || 'dev_secret_key';
     const expires = process.env.JWT_EXPIRES_IN || '7d';
     const token = jwt.sign(
-      { id: user._id, role: user.role, name: user.name, email: user.email },
+      { id: user.id, role: user.role, name: user.name, email: user.email },
       secret,
       { expiresIn: expires }
     );
@@ -432,23 +459,23 @@ exports.googleAuthCallback = async (req, res, next) => {
     const { email, name, picture } = payload;
 
     // Find or create user
-    let user = await User.findOne({ email });
+    let user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
       // Create new user
-      user = await User.create({
-        name,
-        email,
-        role: 'SHIPPER', // Default role for Google signup
-        status: 'ACTIVE',
-        emailVerified: true,
-        profileImage: picture
+      user = await prisma.user.create({
+        data: {
+          name,
+          email,
+          role: 'SHIPPER', // Default role for Google signup
+          status: 'ACTIVE',
+        },
       });
     }
 
     // Generate JWT
     const expiresIn = process.env.JWT_EXPIRES_IN || '30d';
     const token = jwt.sign(
-      { id: user._id, role: user.role, name: user.name, email: user.email },
+      { id: user.id, role: user.role, name: user.name, email: user.email },
       process.env.JWT_SECRET,
       { expiresIn }
     );

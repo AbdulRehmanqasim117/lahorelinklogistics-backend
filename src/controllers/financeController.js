@@ -1,18 +1,31 @@
 const mongoose = require('mongoose');
-const FinancialTransaction = require('../models/FinancialTransaction');
-const Order = require('../models/Order');
-const User = require('../models/User');
-const FinancePeriod = require('../models/FinancePeriod');
+// Legacy Mongoose models are still used for some older finance flows,
+// but company finance summary/ledger calculations (including periods) are now Prisma-based.
+// const FinancialTransaction = require('../models/FinancialTransaction');
+// const Order = require('../models/Order');
+// const User = require('../models/User');
+const prisma = require('../prismaClient');
 
 async function getOrCreateActiveFinancePeriod(userId) {
-  // Try to find the most recent OPEN period
-  let period = await FinancePeriod.findOne({ status: 'OPEN' }).sort({ periodStart: -1 });
-  if (period) return period;
+  let period = await prisma.financePeriod.findFirst({
+    where: { status: 'OPEN' },
+    orderBy: { periodStart: 'desc' },
+  });
 
-  // If none exists, create one starting from the first day of the current month
+  if (period) {
+    return period;
+  }
+
   const now = new Date();
   const start = new Date(now.getFullYear(), now.getMonth(), 1);
-  period = await FinancePeriod.create({ periodStart: start, status: 'OPEN' });
+
+  period = await prisma.financePeriod.create({
+    data: {
+      periodStart: start,
+      status: 'OPEN',
+    },
+  });
+
   return period;
 }
 
@@ -105,108 +118,107 @@ function buildOrderFiltersFromQuery(query) {
     rider,
   } = query || {};
 
-  const baseMatch = {
-    paymentType: 'COD',
-    isDeleted: { $ne: true },
-    status: { $in: ['DELIVERED', 'RETURNED', 'FAILED'] },
-  };
-
   const shipperFilter = shipperId || shipper;
-  if (shipperFilter && mongoose.isValidObjectId(String(shipperFilter))) {
-    baseMatch.shipper = new mongoose.Types.ObjectId(String(shipperFilter));
-  }
-
   const riderFilter = riderId || rider;
-  if (riderFilter && mongoose.isValidObjectId(String(riderFilter))) {
-    baseMatch.assignedRider = new mongoose.Types.ObjectId(String(riderFilter));
-  }
 
   const dateRange = buildDateRangeFromQuery(range, from, to);
 
   return {
-    baseMatch,
-    dateRange,
     range,
     from,
     to,
     shipperId: shipperFilter || null,
     riderId: riderFilter || null,
+    dateRange,
   };
 }
+// Prisma-based equivalent for order filters used in company finance
+function buildPrismaOrderWhere(filters) {
+  const where = {
+    paymentType: 'COD',
+    isDeleted: false,
+    status: { in: ['DELIVERED', 'RETURNED', 'FAILED'] },
+  };
 
-function buildOrdersAggregationBase(orderMatch, dateRange) {
-  const pipeline = [
-    { $match: orderMatch },
-    {
-      $addFields: {
-        effectiveDate: {
-          $cond: [
-            { $ifNull: ['$deliveredAt', false] },
-            '$deliveredAt',
-            '$createdAt',
-          ],
-        },
-      },
-    },
-  ];
-
-  if (dateRange && (dateRange.start || dateRange.end)) {
-    const dateMatch = {};
-    if (dateRange.start) dateMatch.$gte = dateRange.start;
-    if (dateRange.end) dateMatch.$lte = dateRange.end;
-    pipeline.push({ $match: { effectiveDate: dateMatch } });
+  if (filters.shipperId) {
+    const sid = Number(filters.shipperId);
+    if (Number.isInteger(sid) && sid > 0) {
+      where.shipperId = sid;
+    }
   }
 
-  return pipeline;
+  if (filters.riderId) {
+    const rid = Number(filters.riderId);
+    if (Number.isInteger(rid) && rid > 0) {
+      where.assignedRiderId = rid;
+    }
+  }
+
+  if (filters.dateRange && (filters.dateRange.start || filters.dateRange.end)) {
+    const createdAt = {};
+    if (filters.dateRange.start) createdAt.gte = filters.dateRange.start;
+    if (filters.dateRange.end) createdAt.lte = filters.dateRange.end;
+    where.createdAt = createdAt;
+  }
+
+  return where;
 }
 
 exports.getShipperSummary = async (req, res, next) => {
   try {
-    const activePeriod = await getOrCreateActiveFinancePeriod(req.user && req.user.id);
+    const activePeriod = await getOrCreateActiveFinancePeriod(
+      req.user && req.user.id,
+    );
 
-    const match = {};
+    const where = {};
     if (activePeriod && activePeriod.periodStart) {
-      const range = { $gte: activePeriod.periodStart };
       const end = activePeriod.periodEnd || new Date();
-      range.$lte = end;
-      match.createdAt = range;
+      where.createdAt = {
+        gte: activePeriod.periodStart,
+        lte: end,
+      };
     }
 
-    const summary = await FinancialTransaction.aggregate([
-      { $match: match },
-      {
-        $group: {
-          _id: "$shipper",
-          totalCodCollected: { $sum: "$totalCodCollected" },
-          totalShipperShare: { $sum: "$shipperShare" },
-          totalCompanyCommission: { $sum: "$companyCommission" },
-          ordersCount: { $sum: 1 }
-        }
+    const transactions = await prisma.financialTransaction.findMany({
+      where,
+      include: {
+        shipper: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
       },
-      {
-        $lookup: {
-          from: "users",
-          localField: "_id",
-          foreignField: "_id",
-          as: "shipperDetails"
-        }
-      },
-      {
-        $unwind: "$shipperDetails"
-      },
-      {
-        $project: {
-          shipperName: "$shipperDetails.name",
-          shipperEmail: "$shipperDetails.email",
-          totalCodCollected: 1,
-          totalShipperShare: 1,
-          totalCompanyCommission: 1,
-          ordersCount: 1
-        }
-      }
-    ]);
+    });
 
-    res.json(summary);
+    const byShipper = new Map();
+
+    for (const tx of transactions) {
+      const shipperId = tx.shipperId;
+      if (!shipperId) continue;
+
+      let row = byShipper.get(shipperId);
+      if (!row) {
+        row = {
+          _id: shipperId,
+          shipperName: tx.shipper?.name || "",
+          shipperEmail: tx.shipper?.email || "",
+          totalCodCollected: 0,
+          totalShipperShare: 0,
+          totalCompanyCommission: 0,
+          ordersCount: 0,
+        };
+        byShipper.set(shipperId, row);
+      }
+
+      row.totalCodCollected += Number(tx.totalCodCollected || 0);
+      row.totalShipperShare += Number(tx.shipperShare || 0);
+      row.totalCompanyCommission += Number(tx.companyCommission || 0);
+      row.ordersCount += 1;
+    }
+
+    res.json(Array.from(byShipper.values()));
   } catch (error) {
     next(error);
   }
@@ -214,16 +226,40 @@ exports.getShipperSummary = async (req, res, next) => {
 
 exports.getTransactionByOrder = async (req, res, next) => {
   try {
-    const { orderId } = req.params;
-    const tx = await FinancialTransaction.findOne({ order: orderId });
-    if (!tx) return res.status(404).json({ message: 'Transaction not found' });
+    const rawOrderId = req.params && req.params.orderId;
+    const orderId = Number(rawOrderId);
 
-    const role = req.user.role;
-    const uid = req.user.id;
-    if (role === 'SHIPPER' && tx.shipper?.toString() !== uid) {
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      return res.status(400).json({ message: 'Invalid order id' });
+    }
+
+    const tx = await prisma.financialTransaction.findUnique({
+      where: { orderId },
+    });
+
+    if (!tx) {
+      return res.status(404).json({ message: 'Transaction not found' });
+    }
+
+    const role = req.user && req.user.role;
+    const rawUserId = req.user && (req.user.id || req.user._id);
+    const userId = Number(rawUserId);
+
+    if (
+      role === 'SHIPPER' &&
+      Number.isInteger(userId) &&
+      userId > 0 &&
+      tx.shipperId !== userId
+    ) {
       return res.status(403).json({ message: 'Forbidden' });
     }
-    if (role === 'RIDER' && tx.rider?.toString() !== uid) {
+
+    if (
+      role === 'RIDER' &&
+      Number.isInteger(userId) &&
+      userId > 0 &&
+      tx.riderId !== userId
+    ) {
       return res.status(403).json({ message: 'Forbidden' });
     }
 
@@ -235,54 +271,62 @@ exports.getTransactionByOrder = async (req, res, next) => {
 
 exports.getRiderSummary = async (req, res, next) => {
   try {
-    const activePeriod = await getOrCreateActiveFinancePeriod(req.user && req.user.id);
+    const activePeriod = await getOrCreateActiveFinancePeriod(
+      req.user && req.user.id,
+    );
 
-    const match = {};
+    const where = {};
     if (activePeriod && activePeriod.periodStart) {
-      const range = { $gte: activePeriod.periodStart };
       const end = activePeriod.periodEnd || new Date();
-      range.$lte = end;
-      match.createdAt = range;
+      where.createdAt = {
+        gte: activePeriod.periodStart,
+        lte: end,
+      };
     }
 
-    const summary = await FinancialTransaction.aggregate([
-      { $match: match },
-      {
-        $group: {
-          _id: "$rider",
-          totalCodCollected: { $sum: "$totalCodCollected" },
-          deliveredCount: { $sum: 1 },
-          pendingSettlements: {
-            $sum: { $cond: [{ $eq: ["$settlementStatus", "PENDING"] }, 1, 0] }
+    const transactions = await prisma.financialTransaction.findMany({
+      where,
+      include: {
+        rider: {
+          select: {
+            id: true,
+            name: true,
           },
-          settledTransactions: {
-            $sum: { $cond: [{ $eq: ["$settlementStatus", "SETTLED"] }, 1, 0] }
-          }
-        }
+        },
       },
-      {
-        $lookup: {
-          from: "users",
-          localField: "_id",
-          foreignField: "_id",
-          as: "riderDetails"
-        }
-      },
-      {
-        $unwind: { path: "$riderDetails", preserveNullAndEmptyArrays: true }
-      },
-      {
-        $project: {
-          riderName: { $ifNull: ["$riderDetails.name", "Unassigned"] },
-          totalCodCollected: 1,
-          deliveredCount: 1,
-          pendingSettlements: 1,
-          settledTransactions: 1
-        }
-      }
-    ]);
+    });
 
-    res.json(summary);
+    const byRider = new Map();
+
+    for (const tx of transactions) {
+      const riderId = tx.riderId || 0;
+
+      let row = byRider.get(riderId);
+      if (!row) {
+        row = {
+          _id: riderId || null,
+          riderName: tx.rider?.name || 'Unassigned',
+          totalCodCollected: 0,
+          deliveredCount: 0,
+          pendingSettlements: 0,
+          settledTransactions: 0,
+        };
+        byRider.set(riderId, row);
+      }
+
+      row.totalCodCollected += Number(tx.totalCodCollected || 0);
+      row.deliveredCount += 1;
+
+      const st = String(tx.settlementStatus || '').toUpperCase();
+      if (['UNPAID', 'PENDING'].includes(st)) {
+        row.pendingSettlements += 1;
+      }
+      if (['PAID', 'SETTLED'].includes(st)) {
+        row.settledTransactions += 1;
+      }
+    }
+
+    res.json(Array.from(byRider.values()));
   } catch (error) {
     next(error);
   }
@@ -291,12 +335,11 @@ exports.getRiderSummary = async (req, res, next) => {
 exports.settleTransaction = async (req, res, next) => {
   try {
     const { id } = req.params;
-    
-    const transaction = await FinancialTransaction.findByIdAndUpdate(
-      id,
-      { settlementStatus: 'SETTLED' },
-      { new: true }
-    );
+
+    const transaction = await prisma.financialTransaction.update({
+      where: { id },
+      data: { settlementStatus: 'SETTLED' },
+    });
 
     if (!transaction) {
       return res.status(404).json({ message: 'Transaction not found' });
@@ -310,22 +353,52 @@ exports.settleTransaction = async (req, res, next) => {
 
 exports.getMyRiderSummary = async (req, res, next) => {
   try {
-    const riderId = req.user.id;
+    const rawId = req.user && (req.user.id || req.user._id);
+    const riderId = Number(rawId);
+
+    if (!Number.isInteger(riderId) || riderId <= 0) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
 
     const todayStr = new Date().toDateString();
-    const transactions = await FinancialTransaction.find({ rider: riderId }).sort({ createdAt: -1 });
 
-    const totals = transactions.reduce((acc, t) => {
-      acc.totalCodCollected += Number(t.totalCodCollected || 0);
-      if (new Date(t.createdAt).toDateString() === todayStr) {
-        acc.todayCodCollected += Number(t.totalCodCollected || 0);
-      }
-      if (t.settlementStatus === 'PENDING') acc.pendingCount += 1;
-      if (t.settlementStatus === 'SETTLED') acc.settledCount += 1;
-      return acc;
-    }, { totalCodCollected: 0, todayCodCollected: 0, pendingCount: 0, settledCount: 0 });
+    const transactions = await prisma.financialTransaction.findMany({
+      where: { riderId },
+      orderBy: { createdAt: 'desc' },
+    });
 
-    res.json({ totals, transactions });
+    const totals = transactions.reduce(
+      (acc, t) => {
+        const cod = Number(t.totalCodCollected || 0);
+        acc.totalCodCollected += cod;
+
+        const createdDate = t.createdAt
+          ? new Date(t.createdAt).toDateString()
+          : null;
+        if (createdDate === todayStr) {
+          acc.todayCodCollected += cod;
+        }
+
+        const st = String(t.settlementStatus || '').toUpperCase();
+        if (['UNPAID', 'PENDING'].includes(st)) acc.pendingCount += 1;
+        if (['PAID', 'SETTLED'].includes(st)) acc.settledCount += 1;
+
+        return acc;
+      },
+      {
+        totalCodCollected: 0,
+        todayCodCollected: 0,
+        pendingCount: 0,
+        settledCount: 0,
+      },
+    );
+
+    const mapped = transactions.map((t) => ({
+      ...t,
+      _id: t.id,
+    }));
+
+    res.json({ totals, transactions: mapped });
   } catch (error) {
     next(error);
   }
@@ -334,22 +407,49 @@ exports.getMyRiderSummary = async (req, res, next) => {
 exports.getMyShipperSummary = async (req, res, next) => {
   try {
     console.log('DEBUG getMyShipperSummary req.user:', req.user);
-    const shipperId = req.user.id;
+    const rawId = req.user && (req.user.id || req.user._id);
+    const shipperId = Number(rawId);
     console.log('DEBUG getMyShipperSummary shipperId:', shipperId);
-    if (!shipperId) {
+
+    if (!Number.isInteger(shipperId) || shipperId <= 0) {
       console.log('DEBUG getMyShipperSummary NO SHIPPER ID!');
       return res.status(401).json({ message: 'Unauthorized' });
     }
-    const transactions = await FinancialTransaction.find({ shipper: shipperId }).sort({ createdAt: -1 });
-    console.log('DEBUG getMyShipperSummary found transactions:', transactions.length);
-    const totals = transactions.reduce((acc, t) => {
-      acc.totalCodCollected += Number(t.totalCodCollected || 0);
-      acc.totalCompanyCommission += Number(t.companyCommission || 0);
-      acc.totalShipperShare += Number(t.shipperShare || 0);
-      return acc;
-    }, { totalCodCollected: 0, totalCompanyCommission: 0, totalShipperShare: 0 });
-    console.log('DEBUG getMyShipperSummary response:', { totals, transactionCount: transactions.length });
-    res.json({ totals, transactions });
+
+    const transactions = await prisma.financialTransaction.findMany({
+      where: { shipperId },
+      orderBy: { createdAt: 'desc' },
+    });
+    console.log(
+      'DEBUG getMyShipperSummary found transactions:',
+      transactions.length,
+    );
+
+    const totals = transactions.reduce(
+      (acc, t) => {
+        acc.totalCodCollected += Number(t.totalCodCollected || 0);
+        acc.totalCompanyCommission += Number(t.companyCommission || 0);
+        acc.totalShipperShare += Number(t.shipperShare || 0);
+        return acc;
+      },
+      {
+        totalCodCollected: 0,
+        totalCompanyCommission: 0,
+        totalShipperShare: 0,
+      },
+    );
+
+    console.log('DEBUG getMyShipperSummary response:', {
+      totals,
+      transactionCount: transactions.length,
+    });
+
+    const mapped = transactions.map((t) => ({
+      ...t,
+      _id: t.id,
+    }));
+
+    res.json({ totals, transactions: mapped });
   } catch (error) {
     console.error('DEBUG getMyShipperSummary error:', error.message, error.stack);
     next(error);
@@ -358,14 +458,24 @@ exports.getMyShipperSummary = async (req, res, next) => {
 
 exports.setRiderSettlementByOrder = async (req, res, next) => {
   try {
-    const { id } = req.params; // orderId
-
-    const tx = await FinancialTransaction.findOne({ order: id });
-    if (!tx) {
-      return res.status(404).json({ message: 'Transaction not found for this order' });
+    const rawOrderId = req.params && req.params.id;
+    const orderId = Number(rawOrderId);
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      return res.status(400).json({ message: 'Invalid order id' });
     }
 
-    const rawStatus = (req.body && req.body.status) || (req.body && req.body.settlementStatus);
+    const tx = await prisma.financialTransaction.findUnique({
+      where: { orderId },
+    });
+
+    if (!tx) {
+      return res
+        .status(404)
+        .json({ message: 'Transaction not found for this order' });
+    }
+
+    const rawStatus =
+      (req.body && (req.body.status || req.body.settlementStatus)) || '';
     const normalizedStatus = String(rawStatus || '').trim().toUpperCase();
 
     let settlementStatus;
@@ -382,20 +492,24 @@ exports.setRiderSettlementByOrder = async (req, res, next) => {
       settlementStatus = 'PAID';
     }
 
-    const update = {
+    const updateData = {
       settlementStatus,
+      paidAt: null,
+      paidById: null,
     };
 
     if (settlementStatus === 'PAID' || settlementStatus === 'SETTLED') {
-      update.paidAt = new Date();
-      update.paidBy = req.user.id || req.user._id;
-    } else {
-      update.paidAt = null;
-      update.paidBy = null;
+      const rawUserId = req.user && (req.user.id || req.user._id);
+      const paidById = Number(rawUserId);
+      if (Number.isInteger(paidById) && paidById > 0) {
+        updateData.paidAt = new Date();
+        updateData.paidById = paidById;
+      }
     }
 
-    const updated = await FinancialTransaction.findByIdAndUpdate(tx._id, update, {
-      new: true,
+    const updated = await prisma.financialTransaction.update({
+      where: { id: tx.id },
+      data: updateData,
     });
 
     res.json(updated);
@@ -404,131 +518,74 @@ exports.setRiderSettlementByOrder = async (req, res, next) => {
   }
 };
 
-// Company finance summary for CEO/Manager
+// Company finance summary for CEO/Manager (Prisma-based)
 // GET /api/finance/company/summary
 exports.getCompanyFinanceSummary = async (req, res, next) => {
   try {
     const filters = buildOrderFiltersFromQuery(req.query);
+    const where = buildPrismaOrderWhere(filters);
 
-    const pipeline = buildOrdersAggregationBase(filters.baseMatch, filters.dateRange);
+    const orders = await prisma.order.findMany({
+      where,
+      include: {
+        financialTransaction: true,
+      },
+    });
 
-    pipeline.push(
-      {
-        $lookup: {
-          from: 'financialtransactions',
-          localField: '_id',
-          foreignField: 'order',
-          as: 'tx',
-        },
-      },
-      {
-        $unwind: { path: '$tx', preserveNullAndEmptyArrays: true },
-      },
-      {
-        $addFields: {
-          effectiveStatus: { $toUpper: '$status' },
-          codEffective: {
-            $cond: [
-              {
-                $and: [
-                  { $eq: ['$paymentType', 'COD'] },
-                  { $eq: ['$status', 'DELIVERED'] },
-                ],
-              },
-              { $ifNull: ['$amountCollected', '$codAmount'] },
-              0,
-            ],
-          },
-          serviceChargesEff: { $ifNull: ['$serviceCharges', 0] },
-          riderPaid: {
-            $cond: [
-              { $gt: [{ $ifNull: ['$tx.riderCommission', 0] }, 0] },
-              { $ifNull: ['$tx.riderCommission', 0] },
-              { $ifNull: ['$riderEarning', 0] },
-            ],
-          },
-          companyCommissionEff: { $ifNull: ['$tx.companyCommission', 0] },
-          hasCompanyCommission: {
-            $gt: [{ $ifNull: ['$tx.companyCommission', 0] }, 0],
-          },
-          settlementStatusEff: {
-            $toUpper: { $ifNull: ['$tx.settlementStatus', 'UNPAID'] },
-          },
-        },
-      },
-      {
-        $group: {
-          _id: null,
-          ordersCount: { $sum: 1 },
-          totalCod: { $sum: { $ifNull: ['$codEffective', 0] } },
-          totalServiceCharges: { $sum: '$serviceChargesEff' },
-          totalRiderPaid: { $sum: '$riderPaid' },
-          totalCompanyCommission: { $sum: '$companyCommissionEff' },
-          deliveredOrders: {
-            $sum: { $cond: [{ $eq: ['$effectiveStatus', 'DELIVERED'] }, 1, 0] },
-          },
-          returnedOrders: {
-            $sum: { $cond: [{ $eq: ['$effectiveStatus', 'RETURNED'] }, 1, 0] },
-          },
-          pendingRiderSettlementsCount: {
-            $sum: {
-              $cond: [
-                { $in: ['$settlementStatusEff', ['UNPAID', 'PENDING']] },
-                1,
-                0,
-              ],
-            },
-          },
-          pendingRiderSettlementsAmount: {
-            $sum: {
-              $cond: [
-                { $in: ['$settlementStatusEff', ['UNPAID', 'PENDING']] },
-                { $ifNull: ['$riderPaid', 0] },
-                0,
-              ],
-            },
-          },
-          settledRiderTransactionsCount: {
-            $sum: {
-              $cond: [
-                { $in: ['$settlementStatusEff', ['PAID', 'SETTLED']] },
-                1,
-                0,
-              ],
-            },
-          },
-          profitUsingCommission: {
-            $sum: {
-              $cond: [
-                '$hasCompanyCommission',
-                { $subtract: ['$companyCommissionEff', '$riderPaid'] },
-                0,
-              ],
-            },
-          },
-          profitUsingServiceCharges: {
-            $sum: {
-              $cond: [
-                { $not: ['$hasCompanyCommission'] },
-                { $subtract: ['$serviceChargesEff', '$riderPaid'] },
-                0,
-              ],
-            },
-          },
-        },
-      },
-    );
+    let ordersCount = 0;
+    let totalCod = 0;
+    let totalServiceCharges = 0;
+    let deliveredOrders = 0;
+    let returnedOrders = 0;
+    let pendingRiderSettlementsCount = 0;
+    let pendingRiderSettlementsAmount = 0;
+    let settledRiderTransactionsCount = 0;
+    let totalRiderPaid = 0;
+    let totalCompanyCommission = 0;
+    let profitUsingCommission = 0;
+    let profitUsingServiceCharges = 0;
 
-    const agg = await Order.aggregate(pipeline);
-    const row = agg[0] || {};
+    for (const o of orders) {
+      const tx = o.financialTransaction;
+      const effectiveStatus = String(o.status || '').toUpperCase();
+      ordersCount += 1;
 
-    const totalCod = Number(row.totalCod || 0);
-    const totalServiceCharges = Number(row.totalServiceCharges || 0);
+      const codEffective =
+        o.paymentType === 'COD' && effectiveStatus === 'DELIVERED'
+          ? Number(o.amountCollected ?? o.codAmount ?? 0)
+          : 0;
+      const serviceChargesEff = Number(o.serviceCharges || 0);
+      const riderPaid = tx && tx.riderCommission ? Number(tx.riderCommission) : 0;
+      const companyCommissionEff = tx && tx.companyCommission ? Number(tx.companyCommission) : 0;
+      const hasCompanyCommission = companyCommissionEff > 0;
+      const settlementStatusEff = String(tx?.settlementStatus || 'UNPAID').toUpperCase();
+
+      totalCod += codEffective;
+      totalServiceCharges += serviceChargesEff;
+      totalRiderPaid += riderPaid;
+      totalCompanyCommission += companyCommissionEff;
+
+      if (effectiveStatus === 'DELIVERED') deliveredOrders += 1;
+      if (effectiveStatus === 'RETURNED') returnedOrders += 1;
+
+      if (['UNPAID', 'PENDING'].includes(settlementStatusEff) && riderPaid > 0) {
+        pendingRiderSettlementsCount += 1;
+        pendingRiderSettlementsAmount += riderPaid;
+      }
+      if (['PAID', 'SETTLED'].includes(settlementStatusEff) && riderPaid > 0) {
+        settledRiderTransactionsCount += 1;
+      }
+
+      if (hasCompanyCommission) {
+        profitUsingCommission += companyCommissionEff - riderPaid;
+      } else {
+        profitUsingServiceCharges += serviceChargesEff - riderPaid;
+      }
+    }
+
     const totalAmount = totalCod + totalServiceCharges;
-    const companyProfit =
-      Number(row.profitUsingCommission || 0) +
-      Number(row.profitUsingServiceCharges || 0);
-    const unpaidRiderBalances = Number(row.pendingRiderSettlementsAmount || 0);
+    const companyProfit = profitUsingCommission + profitUsingServiceCharges;
+    const unpaidRiderBalances = pendingRiderSettlementsAmount;
 
     res.json({
       filters: {
@@ -539,22 +596,18 @@ exports.getCompanyFinanceSummary = async (req, res, next) => {
         riderId: filters.riderId,
       },
       metrics: {
-        ordersCount: Number(row.ordersCount || 0),
+        ordersCount,
         totalCod,
         totalServiceCharges,
         totalAmount,
-        deliveredOrders: Number(row.deliveredOrders || 0),
-        returnedOrders: Number(row.returnedOrders || 0),
-        pendingRiderSettlementsCount: Number(
-          row.pendingRiderSettlementsCount || 0,
-        ),
-        pendingRiderSettlementsAmount: unpaidRiderBalances,
-        settledRiderTransactionsCount: Number(
-          row.settledRiderTransactionsCount || 0,
-        ),
+        deliveredOrders,
+        returnedOrders,
+        pendingRiderSettlementsCount,
+        pendingRiderSettlementsAmount,
+        settledRiderTransactionsCount,
         unpaidRiderBalances,
-        totalRiderPaid: Number(row.totalRiderPaid || 0),
-        totalCompanyCommission: Number(row.totalCompanyCommission || 0),
+        totalRiderPaid,
+        totalCompanyCommission,
         companyProfit,
       },
     });
@@ -563,7 +616,7 @@ exports.getCompanyFinanceSummary = async (req, res, next) => {
   }
 };
 
-// Company-wide ledger for CEO/Manager
+// Company-wide ledger for CEO/Manager (Prisma-based)
 // GET /api/finance/company/ledger
 exports.getCompanyLedger = async (req, res, next) => {
   try {
@@ -572,153 +625,65 @@ exports.getCompanyLedger = async (req, res, next) => {
     );
 
     const filters = buildOrderFiltersFromQuery(req.query);
-    const pipeline = buildOrdersAggregationBase(
-      filters.baseMatch,
-      filters.dateRange,
-    );
+    const where = buildPrismaOrderWhere(filters);
 
-    pipeline.push(
-      {
-        $lookup: {
-          from: 'users',
-          localField: 'shipper',
-          foreignField: '_id',
-          as: 'shipperDoc',
-        },
+    const orders = await prisma.order.findMany({
+      where,
+      include: {
+        shipper: { select: { id: true, name: true, companyName: true } },
+        financialTransaction: true,
       },
-      {
-        $unwind: { path: '$shipperDoc', preserveNullAndEmptyArrays: true },
-      },
-      {
-        $lookup: {
-          from: 'financialtransactions',
-          localField: '_id',
-          foreignField: 'order',
-          as: 'tx',
-        },
-      },
-      {
-        $unwind: { path: '$tx', preserveNullAndEmptyArrays: true },
-      },
-      {
-        $addFields: {
-          effectiveStatus: { $toUpper: '$status' },
-          codEffective: {
-            $cond: [
-              {
-                $and: [
-                  { $eq: ['$paymentType', 'COD'] },
-                  { $eq: ['$status', 'DELIVERED'] },
-                ],
-              },
-              { $ifNull: ['$amountCollected', '$codAmount'] },
-              0,
-            ],
-          },
-          serviceChargesEff: { $ifNull: ['$serviceCharges', 0] },
-          riderPaid: {
-            $cond: [
-              { $gt: [{ $ifNull: ['$tx.riderCommission', 0] }, 0] },
-              { $ifNull: ['$tx.riderCommission', 0] },
-              { $ifNull: ['$riderEarning', 0] },
-            ],
-          },
-          companyCommissionEff: { $ifNull: ['$tx.companyCommission', 0] },
-          hasCompanyCommission: {
-            $gt: [{ $ifNull: ['$tx.companyCommission', 0] }, 0],
-          },
-          settlementStatusEff: {
-            $toUpper: { $ifNull: ['$tx.settlementStatus', 'UNPAID'] },
-          },
-          shipperName: {
-            $ifNull: ['$shipperDoc.companyName', '$shipperDoc.name'],
-          },
-        },
-      },
-      {
-        $addFields: {
-          riderPayoutPaidComponent: {
-            $cond: [
-              {
-                $and: [
-                  { $gt: ['$riderPaid', 0] },
-                  {
-                    $in: [
-                      '$settlementStatusEff',
-                      ['PAID', 'SETTLED'],
-                    ],
-                  },
-                ],
-              },
-              '$riderPaid',
-              0,
-            ],
-          },
-          riderPayoutUnpaidComponent: {
-            $cond: [
-              {
-                $and: [
-                  { $gt: ['$riderPaid', 0] },
-                  {
-                    $in: [
-                      '$settlementStatusEff',
-                      ['UNPAID', 'PENDING'],
-                    ],
-                  },
-                ],
-              },
-              '$riderPaid',
-              0,
-            ],
-          },
-          companyProfitPerOrder: {
-            $cond: [
-              '$hasCompanyCommission',
-              { $subtract: ['$companyCommissionEff', '$riderPaid'] },
-              { $subtract: ['$serviceChargesEff', '$riderPaid'] },
-            ],
-          },
-        },
-      },
-      {
-        $sort: {
-          effectiveDate: -1,
-          'shipperName': 1,
-        },
-      },
-      {
-        $project: {
-          bookingId: 1,
-          trackingId: 1,
-          shipper: 1,
-          shipperName: 1,
-          effectiveDate: 1,
-          effectiveStatus: 1,
-          codEffective: 1,
-          serviceChargesEff: 1,
-          riderPayoutPaidComponent: 1,
-          riderPayoutUnpaidComponent: 1,
-          companyProfitPerOrder: 1,
-        },
-      },
-    );
+      orderBy: [
+        { deliveredAt: 'desc' },
+        { createdAt: 'desc' },
+      ],
+    });
 
-    const docs = await Order.aggregate(pipeline);
+    const rows = orders.map((o) => {
+      const tx = o.financialTransaction;
+      const effectiveStatus = String(o.status || '').toUpperCase();
+      const effectiveDate = o.deliveredAt || o.createdAt;
 
-    const rows = docs.map((doc) => ({
-      id: String(doc._id),
-      date: doc.effectiveDate || doc.createdAt,
-      shipperId: doc.shipper,
-      shipperName: doc.shipperName,
-      bookingId: doc.bookingId,
-      trackingId: doc.trackingId,
-      cod: Number(doc.codEffective || 0),
-      serviceCharges: Number(doc.serviceChargesEff || 0),
-      riderPayout: Number(doc.riderPayoutPaidComponent || 0),
-      riderPayoutUnpaid: Number(doc.riderPayoutUnpaidComponent || 0),
-      companyProfit: Number(doc.companyProfitPerOrder || 0),
-      status: doc.effectiveStatus,
-    }));
+      const codEffective =
+        o.paymentType === 'COD' && effectiveStatus === 'DELIVERED'
+          ? Number(o.amountCollected ?? o.codAmount ?? 0)
+          : 0;
+      const serviceChargesEff = Number(o.serviceCharges || 0);
+      const riderPaid = tx && tx.riderCommission ? Number(tx.riderCommission) : 0;
+      const companyCommissionEff = tx && tx.companyCommission ? Number(tx.companyCommission) : 0;
+      const hasCompanyCommission = companyCommissionEff > 0;
+      const settlementStatusEff = String(tx?.settlementStatus || 'UNPAID').toUpperCase();
+
+      const riderPayoutPaidComponent =
+        riderPaid > 0 && ['PAID', 'SETTLED'].includes(settlementStatusEff)
+          ? riderPaid
+          : 0;
+      const riderPayoutUnpaidComponent =
+        riderPaid > 0 && ['UNPAID', 'PENDING'].includes(settlementStatusEff)
+          ? riderPaid
+          : 0;
+
+      const companyProfitPerOrder = hasCompanyCommission
+        ? companyCommissionEff - riderPaid
+        : serviceChargesEff - riderPaid;
+
+      const shipperName = o.shipper?.companyName || o.shipper?.name || '';
+
+      return {
+        id: o.id.toString(),
+        date: effectiveDate,
+        shipperId: o.shipperId,
+        shipperName,
+        bookingId: o.bookingId,
+        trackingId: o.trackingId,
+        cod: codEffective,
+        serviceCharges: serviceChargesEff,
+        riderPayout: riderPayoutPaidComponent,
+        riderPayoutUnpaid: riderPayoutUnpaidComponent,
+        companyProfit: companyProfitPerOrder,
+        status: effectiveStatus,
+      };
+    });
 
     const totals = rows.reduce(
       (acc, row) => {
@@ -756,38 +721,49 @@ exports.getCompanyLedger = async (req, res, next) => {
 // POST /api/finance/company/close-month - CEO/MANAGER only
 exports.closeCurrentFinanceMonth = async (req, res, next) => {
   try {
-    const userId = req.user && (req.user.id || req.user._id);
+    const rawUserId = req.user && (req.user.id || req.user._id);
+    const numericUserId = Number(rawUserId);
+    const closedById =
+      Number.isInteger(numericUserId) && numericUserId > 0 ? numericUserId : null;
 
-    let active = await FinancePeriod.findOne({ status: 'OPEN' }).sort({ periodStart: -1 });
+    let active = await prisma.financePeriod.findFirst({
+      where: { status: 'OPEN' },
+      orderBy: { periodStart: 'desc' },
+    });
+
     if (!active) {
-      active = await getOrCreateActiveFinancePeriod(userId);
+      active = await getOrCreateActiveFinancePeriod(closedById);
     }
 
     const periodStart = new Date(active.periodStart);
     const periodEnd = new Date(periodStart);
-    // Set periodEnd to last day of the month at 23:59:59.999
     periodEnd.setMonth(periodEnd.getMonth() + 1, 0);
     periodEnd.setHours(23, 59, 59, 999);
 
-    active.status = 'CLOSED';
-    active.periodEnd = periodEnd;
-    active.closedAt = new Date();
-    if (userId) active.closedBy = userId;
-    await active.save();
+    const closed = await prisma.financePeriod.update({
+      where: { id: active.id },
+      data: {
+        status: 'CLOSED',
+        periodEnd,
+        closedAt: new Date(),
+        closedById,
+      },
+    });
 
-    // Start a new active period from the beginning of the next day
     const nextStart = new Date(periodEnd.getTime() + 1);
     nextStart.setHours(0, 0, 0, 0);
 
-    const newActive = await FinancePeriod.create({
-      periodStart: nextStart,
-      status: 'OPEN',
+    const newActive = await prisma.financePeriod.create({
+      data: {
+        periodStart: nextStart,
+        status: 'OPEN',
+      },
     });
 
     res.json({
       success: true,
-      closedPeriodId: active._id,
-      newActivePeriodId: newActive._id,
+      closedPeriodId: closed.id,
+      newActivePeriodId: newActive.id,
       activePeriod: newActive,
     });
   } catch (error) {

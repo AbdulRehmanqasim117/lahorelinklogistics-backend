@@ -1,10 +1,12 @@
-const Order = require('../models/Order');
-const User = require('../models/User');
+// Legacy Mongoose models replaced by Prisma for dashboard stats
+// const Order = require('../models/Order');
+// const User = require('../models/User');
+const prisma = require('../prismaClient');
 
 exports.getManagerDashboard = async (req, res, next) => {
   try {
     const { period = 'today' } = req.query;
-    
+
     let startDate = new Date();
     startDate.setHours(0, 0, 0, 0);
     let endDate = new Date();
@@ -18,36 +20,51 @@ exports.getManagerDashboard = async (req, res, next) => {
       startDate.setDate(1);
     }
 
-    const visibility = {
-      $or: [
-        { isIntegrated: { $ne: true } },
-        { isIntegrated: true, bookingState: 'BOOKED' }
-      ]
+    const visibilityWhere = {
+      OR: [
+        { isIntegrated: false },
+        { isIntegrated: true, bookingState: 'BOOKED' },
+      ],
     };
 
-    const orders = await Order.find({
-      createdAt: { $gte: startDate, $lte: endDate },
-      ...visibility
-    }).populate('shipper', 'name email').populate('assignedRider', 'name');
+    const orders = await prisma.order.findMany({
+      where: {
+        createdAt: { gte: startDate, lte: endDate },
+        ...visibilityWhere,
+      },
+      include: {
+        shipper: { select: { id: true, name: true, email: true } },
+        assignedRider: { select: { id: true, name: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
 
     const totalOrders = orders.length;
-    const completedOrders = orders.filter(o => o.status === 'DELIVERED').length;
-    const pendingOrders = orders.filter(o => ['CREATED', 'ASSIGNED'].includes(o.status)).length;
-    const assignedOrders = orders.filter(o => o.assignedRider && ['ASSIGNED', 'OUT_FOR_DELIVERY'].includes(o.status)).length;
-    const unassignedOrders = orders.filter(o => !o.assignedRider || o.status === 'CREATED').length;
+    const completedOrders = orders.filter((o) => o.status === 'DELIVERED').length;
+    const pendingOrders = orders.filter((o) => ['CREATED', 'ASSIGNED'].includes(o.status)).length;
+    const assignedOrders = orders.filter(
+      (o) => o.assignedRiderId && ['ASSIGNED', 'OUT_FOR_DELIVERY'].includes(o.status),
+    ).length;
+    const unassignedOrders = orders.filter(
+      (o) => !o.assignedRiderId || o.status === 'CREATED',
+    ).length;
 
     const totalCod = orders
-      .filter(o => o.status === 'DELIVERED')
-      .reduce((sum, o) => sum + Number(o.amountCollected || o.codAmount || 0), 0);
+      .filter((o) => o.status === 'DELIVERED')
+      .reduce(
+        (sum, o) => sum + Number(o.amountCollected ?? o.codAmount ?? 0),
+        0,
+      );
 
     const totalServiceCharges = orders
-      .filter(o => o.status === 'DELIVERED')
-      .reduce((sum, o) => sum + Number(o.serviceCharges || 0), 0);
+      .filter((o) => o.status === 'DELIVERED')
+      .reduce((sum, o) => sum + Number(o.serviceCharges ?? 0), 0);
 
-    // Count orders at LLL warehouse
-    const warehouseOrdersCount = await Order.countDocuments({
-      status: 'AT_LLL_WAREHOUSE',
-      ...visibility
+    const warehouseOrdersCount = await prisma.order.count({
+      where: {
+        status: 'AT_LLL_WAREHOUSE',
+        ...visibilityWhere,
+      },
     });
 
     res.json({
@@ -60,9 +77,9 @@ exports.getManagerDashboard = async (req, res, next) => {
         unassignedOrders,
         totalCod,
         totalServiceCharges,
-        warehouseOrdersCount
+        warehouseOrdersCount,
       },
-      orders: orders.slice(0, 50) // Return recent orders
+      orders: orders.slice(0, 50),
     });
   } catch (error) {
     next(error);
@@ -72,7 +89,7 @@ exports.getManagerDashboard = async (req, res, next) => {
 exports.getCeoDashboard = async (req, res, next) => {
   try {
     const { period = 'today' } = req.query;
-    
+
     let startDate = new Date();
     startDate.setHours(0, 0, 0, 0);
     let endDate = new Date();
@@ -86,41 +103,56 @@ exports.getCeoDashboard = async (req, res, next) => {
       startDate.setDate(1);
     }
 
-    const visibility = {
-      $or: [
-        { isIntegrated: { $ne: true } },
-        { isIntegrated: true, bookingState: 'BOOKED' }
-      ]
+    const visibilityWhere = {
+      OR: [
+        { isIntegrated: false },
+        { isIntegrated: true, bookingState: 'BOOKED' },
+      ],
     };
 
-    const orders = await Order.find({
-      createdAt: { $gte: startDate, $lte: endDate },
-      ...visibility
-    }).populate('shipper', 'name email').populate('assignedRider', 'name');
+    const orders = await prisma.order.findMany({
+      where: {
+        createdAt: { gte: startDate, lte: endDate },
+        ...visibilityWhere,
+      },
+      include: {
+        shipper: { select: { id: true, name: true, email: true } },
+        assignedRider: { select: { id: true, name: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
 
     const totalOrders = orders.length;
-    const completedOrders = orders.filter(o => o.status === 'DELIVERED').length;
-    const pendingOrders = orders.filter(o => ['CREATED', 'ASSIGNED'].includes(o.status)).length;
-    const assignedOrders = orders.filter(o => o.assignedRider && ['ASSIGNED', 'OUT_FOR_DELIVERY'].includes(o.status)).length;
-    const unassignedOrders = orders.filter(o => !o.assignedRider || o.status === 'CREATED').length;
+    const completedOrders = orders.filter((o) => o.status === 'DELIVERED').length;
+    const pendingOrders = orders.filter((o) => ['CREATED', 'ASSIGNED'].includes(o.status)).length;
+    const assignedOrders = orders.filter(
+      (o) => o.assignedRiderId && ['ASSIGNED', 'OUT_FOR_DELIVERY'].includes(o.status),
+    ).length;
+    const unassignedOrders = orders.filter(
+      (o) => !o.assignedRiderId || o.status === 'CREATED',
+    ).length;
 
     const totalCod = orders
-      .filter(o => o.status === 'DELIVERED')
-      .reduce((sum, o) => sum + Number(o.amountCollected || o.codAmount || 0), 0);
+      .filter((o) => o.status === 'DELIVERED')
+      .reduce(
+        (sum, o) => sum + Number(o.amountCollected ?? o.codAmount ?? 0),
+        0,
+      );
 
     const totalServiceCharges = orders
-      .filter(o => o.status === 'DELIVERED')
-      .reduce((sum, o) => sum + Number(o.serviceCharges || 0), 0);
+      .filter((o) => o.status === 'DELIVERED')
+      .reduce((sum, o) => sum + Number(o.serviceCharges ?? 0), 0);
 
-    // Get user counts
-    const totalShippers = await User.countDocuments({ role: 'SHIPPER' });
-    const totalRiders = await User.countDocuments({ role: 'RIDER' });
-
-    // Count orders at LLL warehouse
-    const warehouseOrdersCount = await Order.countDocuments({
-      status: 'AT_LLL_WAREHOUSE',
-      ...visibility
-    });
+    const [totalShippers, totalRiders, warehouseOrdersCount] = await Promise.all([
+      prisma.user.count({ where: { role: 'SHIPPER' } }),
+      prisma.user.count({ where: { role: 'RIDER' } }),
+      prisma.order.count({
+        where: {
+          status: 'AT_LLL_WAREHOUSE',
+          ...visibilityWhere,
+        },
+      }),
+    ]);
 
     res.json({
       period,
@@ -134,9 +166,9 @@ exports.getCeoDashboard = async (req, res, next) => {
         totalServiceCharges,
         totalShippers,
         totalRiders,
-        warehouseOrdersCount
+        warehouseOrdersCount,
       },
-      orders: orders.slice(0, 50) // Return recent orders
+      orders: orders.slice(0, 50),
     });
   } catch (error) {
     next(error);

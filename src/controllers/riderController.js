@@ -2,6 +2,7 @@ const RiderProfile = require('../models/RiderProfile');
 const User = require('../models/User');
 const Order = require('../models/Order');
 const ExcelJS = require('exceljs');
+const prisma = require('../prismaClient');
 
 /**
  * Rider Self-Assign via QR Scanner
@@ -84,120 +85,189 @@ exports.scanAssign = async (req, res, next) => {
   }
 };
 
+// Manager/CEO rider finance list (used by ManagerRiders & CEO Riders pages)
+// Migrated to Prisma to avoid Mongo users.find() timeouts.
 exports.getRidersWithFinance = async (req, res, next) => {
   try {
-    const riders = await User.find({ role: 'RIDER' }).sort({ createdAt: -1 });
-    
-    const ridersWithFinance = await Promise.all(
-      riders.map(async (rider) => {
-        const profile = await RiderProfile.findOne({ user: rider._id });
-        const assignedOrders = await Order.countDocuments({ assignedRider: rider._id });
-        
-        return {
-          ...rider.toObject(),
-          codCollected: profile?.codCollected || 0,
-          serviceCharges: profile?.serviceCharges || 0,
-          serviceChargeStatus: profile?.serviceChargeStatus || 'unpaid',
-          assignedOrders
-        };
-      })
-    );
+    const riders = await prisma.user.findMany({
+      where: { role: 'RIDER' },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        riderProfile: true,
+        ordersRidden: {
+          where: { isDeleted: false },
+          select: { id: true },
+        },
+      },
+    });
 
-    res.json(ridersWithFinance);
+    const mapped = riders.map((rider) => {
+      const profile = rider.riderProfile;
+      const assignedOrders = rider.ordersRidden ? rider.ordersRidden.length : 0;
+
+      return {
+        _id: String(rider.id),
+        id: rider.id,
+        name: rider.name,
+        email: rider.email,
+        phone: rider.phone,
+        role: rider.role,
+        status: rider.status,
+        codCollected: profile?.codCollected || 0,
+        serviceCharges: profile?.serviceCharges || 0,
+        serviceChargeStatus: profile?.serviceChargeStatus || 'unpaid',
+        assignedOrders,
+      };
+    });
+
+    res.json(mapped);
   } catch (error) {
     next(error);
   }
 };
 
+// Toggle rider service charge status (paid/unpaid) using Prisma RiderProfile
 exports.updateServiceChargeStatus = async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const { status } = req.body;
+    const rawId = req.params && req.params.id;
+    const userId = Number(rawId);
+    const { status } = req.body || {};
 
-    if (!['paid', 'unpaid'].includes(status)) {
-      return res.status(400).json({ message: 'Invalid status. Must be "paid" or "unpaid"' });
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({ message: 'Invalid rider id' });
     }
 
-    let riderProfile = await RiderProfile.findOne({ user: id });
-    
-    if (!riderProfile) {
-      // Create profile if it doesn't exist
-      riderProfile = await RiderProfile.create({
-        user: id,
-        codCollected: 0,
-        serviceCharges: 0,
-        serviceChargeStatus: status
+    if (!['paid', 'unpaid'].includes(status)) {
+      return res
+        .status(400)
+        .json({ message: 'Invalid status. Must be "paid" or "unpaid"' });
+    }
+
+    // Ensure rider exists
+    const rider = await prisma.user.findUnique({ where: { id: userId } });
+    if (!rider || rider.role !== 'RIDER') {
+      return res.status(404).json({ message: 'Rider not found' });
+    }
+
+    let profile = await prisma.riderProfile.findUnique({
+      where: { userId },
+    });
+
+    if (!profile) {
+      profile = await prisma.riderProfile.create({
+        data: {
+          userId,
+          codCollected: 0,
+          serviceCharges: 0,
+          serviceChargeStatus: status,
+        },
       });
     } else {
       if (status === 'paid') {
-        riderProfile.serviceCharges = 0;
-        riderProfile.serviceChargeStatus = 'paid';
+        profile = await prisma.riderProfile.update({
+          where: { userId },
+          data: {
+            serviceCharges: 0,
+            serviceChargeStatus: 'paid',
+          },
+        });
       } else {
-        riderProfile.serviceChargeStatus = 'unpaid';
+        profile = await prisma.riderProfile.update({
+          where: { userId },
+          data: {
+            serviceChargeStatus: 'unpaid',
+          },
+        });
       }
-      await riderProfile.save();
     }
 
-    res.json(riderProfile);
+    res.json(profile);
   } catch (error) {
     next(error);
   }
 };
 
+// Daily Excel report for a rider's orders on a specific date (Prisma-based)
 exports.getDailyReport = async (req, res, next) => {
   try {
-    const { id } = req.params;
+    const rawId = req.params && req.params.id;
+    const riderId = Number(rawId);
     const { date } = req.query;
 
-    if (!date) {
-      return res.status(400).json({ message: 'Date parameter is required (YYYY-MM-DD)' });
+    if (!Number.isInteger(riderId) || riderId <= 0) {
+      return res.status(400).json({ message: 'Invalid rider id' });
     }
 
-    const rider = await User.findById(id);
+    if (!date) {
+      return res
+        .status(400)
+        .json({ message: 'Date parameter is required (YYYY-MM-DD)' });
+    }
+
+    const rider = await prisma.user.findUnique({ where: { id: riderId } });
     if (!rider || rider.role !== 'RIDER') {
       return res.status(404).json({ message: 'Rider not found' });
     }
 
     const startDate = new Date(date);
+    if (Number.isNaN(startDate.getTime())) {
+      return res
+        .status(400)
+        .json({ message: 'Invalid date format. Use YYYY-MM-DD' });
+    }
     startDate.setHours(0, 0, 0, 0);
-    const endDate = new Date(date);
+    const endDate = new Date(startDate);
     endDate.setHours(23, 59, 59, 999);
 
-    const orders = await Order.find({
-      assignedRider: id,
-      createdAt: { $gte: startDate, $lte: endDate }
-    }).populate('shipper', 'name');
+    const orders = await prisma.order.findMany({
+      where: {
+        assignedRiderId: riderId,
+        createdAt: {
+          gte: startDate,
+          lte: endDate,
+        },
+        isDeleted: false,
+      },
+      include: {
+        shipper: {
+          select: { name: true, companyName: true },
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
 
-    // Create Excel workbook
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet('Rider Daily Report');
 
-    // Add headers
     worksheet.columns = [
       { header: 'Order ID', key: 'bookingId', width: 15 },
       { header: 'Consignee Name', key: 'consigneeName', width: 25 },
       { header: 'COD', key: 'codAmount', width: 15 },
       { header: 'Status', key: 'status', width: 20 },
       { header: 'City', key: 'destinationCity', width: 15 },
-      { header: 'Service Charges', key: 'serviceCharges', width: 18 }
+      { header: 'Service Charges', key: 'serviceCharges', width: 18 },
     ];
 
-    // Add data
-    orders.forEach(order => {
+    orders.forEach((order) => {
       worksheet.addRow({
         bookingId: order.bookingId,
         consigneeName: order.consigneeName,
         codAmount: order.amountCollected || order.codAmount || 0,
         status: order.status,
         destinationCity: order.destinationCity,
-        serviceCharges: order.serviceCharges || 0
+        serviceCharges: order.serviceCharges || 0,
       });
     });
 
-    // Add summary row
-    const totalCod = orders.reduce((sum, o) => sum + Number(o.amountCollected || o.codAmount || 0), 0);
-    const totalServiceCharges = orders.reduce((sum, o) => sum + Number(o.serviceCharges || 0), 0);
-    
+    const totalCod = orders.reduce(
+      (sum, o) => sum + Number(o.amountCollected || o.codAmount || 0),
+      0,
+    );
+    const totalServiceCharges = orders.reduce(
+      (sum, o) => sum + Number(o.serviceCharges || 0),
+      0,
+    );
+
     worksheet.addRow({});
     worksheet.addRow({
       bookingId: 'TOTAL',
@@ -205,22 +275,25 @@ exports.getDailyReport = async (req, res, next) => {
       codAmount: totalCod,
       status: '',
       destinationCity: '',
-      serviceCharges: totalServiceCharges
+      serviceCharges: totalServiceCharges,
     });
 
-    // Style header row
     worksheet.getRow(1).font = { bold: true };
     worksheet.getRow(1).fill = {
       type: 'pattern',
       pattern: 'solid',
-      fgColor: { argb: 'FFE0E0E0' }
+      fgColor: { argb: 'FFE0E0E0' },
     };
 
-    // Set response headers
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename=rider-${rider.name}-${date}.xlsx`);
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename=rider-${rider.name}-${date}.xlsx`,
+    );
 
-    // Write to response
     await workbook.xlsx.write(res);
     res.end();
   } catch (error) {

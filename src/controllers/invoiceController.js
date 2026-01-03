@@ -1,45 +1,190 @@
-const Invoice = require("../models/Invoice");
-const InvoiceCounter = require("../models/InvoiceCounter");
-const Order = require("../models/Order");
-const User = require("../models/User");
-const CommissionConfig = require("../models/CommissionConfig");
 const ExcelJS = require("exceljs");
+const prisma = require("../prismaClient");
+
+// Basic date parsing helper that understands HTML date inputs (YYYY-MM-DD)
+// and falls back to native Date parsing. Returns null if invalid.
+const parseDateInput = (raw) => {
+  if (!raw) return null;
+  const value = String(raw).trim();
+  if (!value) return null;
+
+  // HTML date input: YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const [y, m, d] = value.split("-").map((v) => parseInt(v, 10));
+    const dt = new Date(y, m - 1, d);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  const dt = new Date(value);
+  return Number.isNaN(dt.getTime()) ? null : dt;
+};
 
 // Helper function to calculate service charges if missing
 const calculateServiceCharges = async (order) => {
-  if (order.serviceCharges > 0) {
-    return order.serviceCharges;
+  const existing = Number(order.serviceCharges || 0);
+  if (existing > 0) {
+    return existing;
   }
 
   try {
-    const commissionConfig = await CommissionConfig.findOne({
-      shipper: order.shipper,
-    });
-    if (
-      !commissionConfig ||
-      !Array.isArray(commissionConfig.weightBrackets) ||
-      commissionConfig.weightBrackets.length === 0
-    ) {
+    const shipperId =
+      order.shipperId || order.shipper?.id || order.shipper?.shipperId || null;
+    const weightKg = Number(order.weightKg || 0);
+
+    if (!shipperId || !weightKg) {
       return 0;
     }
 
-    const bracketsSorted = commissionConfig.weightBrackets
-      .slice()
-      .sort((a, b) => a.minKg - b.minKg);
-    const matching = bracketsSorted.find(
-      (b) =>
-        order.weightKg >= b.minKg &&
-        (b.maxKg === null ||
-          typeof b.maxKg === "undefined" ||
-          order.weightKg < b.maxKg),
-    );
+    const cfg = await prisma.commissionConfig.findUnique({
+      where: { shipperId: Number(shipperId) },
+      include: { weightBrackets: true },
+    });
 
-    return matching ? matching.charge : 0;
+    if (!cfg || !Array.isArray(cfg.weightBrackets) || cfg.weightBrackets.length === 0) {
+      return 0;
+    }
+
+    const bracketsSorted = cfg.weightBrackets
+      .slice()
+      .sort((a, b) => Number(a.minKg || 0) - Number(b.minKg || 0));
+
+    const matching = bracketsSorted.find((b) => {
+      const min = Number(b.minKg || 0);
+      const max = b.maxKg === null || typeof b.maxKg === "undefined"
+        ? null
+        : Number(b.maxKg);
+      const withinMin = weightKg >= min;
+      const withinMax = max === null ? true : weightKg < max;
+      return withinMin && withinMax;
+    });
+
+    return matching ? Number(matching.chargePkr || 0) : 0;
   } catch (error) {
     console.error("Error calculating service charges:", error);
     return 0;
   }
 };
+
+const formatInvoiceNumber = (seq) => {
+  const safeSeq = Number(seq || 0);
+  return `A${safeSeq.toString().padStart(5, "0")}`;
+};
+
+const getNextInvoiceNumberPreviewInternal = async () => {
+  const counter = await prisma.counter.findUnique({
+    where: { key: "PAYMENT_INVOICE" },
+  });
+
+  if (counter) {
+    return formatInvoiceNumber(counter.seq + 1);
+  }
+
+  const latest = await prisma.invoice.findFirst({
+    where: { invoiceNumber: { startsWith: "A" } },
+    orderBy: { invoiceNumber: "desc" },
+    select: { invoiceNumber: true },
+  });
+
+  const latestSeq = latest?.invoiceNumber
+    ? Number(String(latest.invoiceNumber).slice(1)) || 0
+    : 0;
+
+  return formatInvoiceNumber(latestSeq + 1);
+};
+
+const allocateNextInvoiceNumber = async (tx) => {
+  const counter = await tx.counter.upsert({
+    where: { key: "PAYMENT_INVOICE" },
+    update: { seq: { increment: 1 } },
+    create: { key: "PAYMENT_INVOICE", seq: 1 },
+  });
+
+  return formatInvoiceNumber(counter.seq);
+};
+
+const mapShipperForInvoice = (user) => {
+  if (!user) return null;
+  return {
+    _id: String(user.id),
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    companyName: user.companyName || null,
+    phone: user.phone || user.contactNumber || null,
+    address: user.pickupAddress || null,
+    bankName: user.bankName || null,
+    accountHolderName: user.accountHolderName || null,
+    accountNumber: user.accountNumber || null,
+    iban: user.iban || null,
+  };
+};
+
+const mapOrderForInvoiceList = (order, serviceCharges) => {
+  const codAmount = Number(order.codAmount || 0);
+  const svc = Number(order.serviceCharges || serviceCharges || 0);
+
+  return {
+    _id: String(order.id),
+    id: order.id,
+    bookingId: order.bookingId,
+    trackingId: order.trackingId,
+    consigneeName: order.consigneeName,
+    destinationCity: order.destinationCity,
+    weightKg: Number(order.weightKg || 0),
+    codAmount,
+    serviceCharges: svc,
+    status: order.status,
+    createdAt: order.createdAt,
+    shipper: mapShipperForInvoice(order.shipper),
+    invoice: order.invoice
+      ? {
+          _id: order.invoice.id,
+          id: order.invoice.id,
+          invoiceNumber: order.invoice.invoiceNumber,
+        }
+      : null,
+  };
+};
+
+const mapInvoiceOrder = (order) => ({
+  _id: order.id,
+  id: order.id,
+  bookingId: order.bookingId,
+  trackingId: order.trackingId,
+  createdAt: order.createdAt,
+  consigneeName: order.consigneeName,
+  destinationCity: order.destinationCity,
+  weightKg: Number(order.weightKg || 0),
+  codAmount: Number(order.codAmount || 0),
+  serviceCharges: Number(order.serviceCharges || 0),
+  status: order.status,
+});
+
+const mapInvoice = (invoice) => ({
+  _id: invoice.id,
+  id: invoice.id,
+  invoiceNumber: invoice.invoiceNumber,
+  shipper: mapShipperForInvoice(invoice.shipper),
+  accountName: invoice.accountName,
+  accountNumber: invoice.accountNumber || "",
+  invoiceDate: invoice.invoiceDate,
+  parcelFrom: invoice.parcelFrom,
+  parcelTo: invoice.parcelTo,
+  codTotal: Number(invoice.codTotal || 0),
+  flyerChargesTotal: Number(invoice.flyerChargesTotal || invoice.serviceChargesTotal || 0),
+  serviceChargesTotal: Number(invoice.serviceChargesTotal || 0),
+  fuelCharges: Number(invoice.fuelCharges || 0),
+  otherCharges: Number(invoice.otherCharges || 0),
+  discount: Number(invoice.discount || 0),
+  whtIt: Number(invoice.whtIt || 0),
+  whtSt: Number(invoice.whtSt || 0),
+  netPayable: Number(invoice.netPayable || 0),
+  createdBy: invoice.createdBy
+    ? { _id: invoice.createdBy.id, id: invoice.createdBy.id, name: invoice.createdBy.name }
+    : null,
+  status: invoice.status,
+  orders: invoice.orders ? invoice.orders.map(mapInvoiceOrder) : [],
+});
 
 // Get orders for invoice (with filters)
 exports.getOrdersForInvoice = async (req, res, next) => {
@@ -50,50 +195,56 @@ exports.getOrdersForInvoice = async (req, res, next) => {
       return res.status(400).json({ message: "Shipper ID is required" });
     }
 
-    const query = {
-      shipper: shipperId,
+    const shipperIdNum = Number(shipperId);
+    if (!Number.isInteger(shipperIdNum) || shipperIdNum <= 0) {
+      return res.status(400).json({ message: "Invalid shipper id" });
+    }
+
+    const where = {
+      shipperId: shipperIdNum,
       bookingState: "BOOKED",
+      isDeleted: false,
     };
 
-    // Date filter
     if (from && to) {
-      // Parse dates and set proper time boundaries
       const fromDate = new Date(from);
       const toDate = new Date(to);
 
-      // Set fromDate to start of day (00:00:00.000)
       fromDate.setHours(0, 0, 0, 0);
-
-      // Set toDate to end of day (23:59:59.999)
       toDate.setHours(23, 59, 59, 999);
 
-      query.createdAt = {
-        $gte: fromDate,
-        $lte: toDate,
-      };
+      if (!Number.isNaN(fromDate.getTime()) && !Number.isNaN(toDate.getTime())) {
+        where.createdAt = {
+          gte: fromDate,
+          lte: toDate,
+        };
+      }
     }
 
-    // Invoice status filter
     if (list === "invoiced") {
-      query.invoice = { $ne: null };
+      where.invoiceId = { not: null };
     } else if (list === "uninvoiced") {
-      query.invoice = null;
+      where.invoiceId = null;
     }
 
-    const orders = await Order.find(query)
-      .populate("shipper", "name email companyName")
-      .populate("invoice", "invoiceNumber")
-      .sort({ createdAt: -1 })
-      .lean();
+    const orders = await prisma.order.findMany({
+      where,
+      include: {
+        shipper: true,
+        invoice: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+          },
+        },
+      },
+      orderBy: { createdAt: "desc" },
+    });
 
-    // Calculate service charges for orders that don't have them
     const ordersWithCharges = await Promise.all(
       orders.map(async (order) => {
-        const serviceCharges = await calculateServiceCharges(order);
-        return {
-          ...order,
-          serviceCharges: order.serviceCharges || serviceCharges,
-        };
+        const svc = await calculateServiceCharges(order);
+        return mapOrderForInvoiceList(order, svc);
       }),
     );
 
@@ -118,11 +269,11 @@ exports.createInvoice = async (req, res, next) => {
       whtSt = 0,
     } = req.body;
 
-    // Validation
     if (
       !shipperId ||
       !accountName ||
       !selectedOrderIds ||
+      !Array.isArray(selectedOrderIds) ||
       selectedOrderIds.length === 0
     ) {
       return res.status(400).json({
@@ -131,34 +282,60 @@ exports.createInvoice = async (req, res, next) => {
       });
     }
 
-    // Fetch selected orders
-    const orders = await Order.find({
-      _id: { $in: selectedOrderIds },
-      shipper: shipperId,
-      invoice: null, // Ensure orders are not already invoiced
+    const shipperIdNum = Number(shipperId);
+    if (!Number.isInteger(shipperIdNum) || shipperIdNum <= 0) {
+      return res.status(400).json({ message: "Invalid shipper id" });
+    }
+
+    const orderIds = selectedOrderIds
+      .map((id) => Number(id))
+      .filter((id) => Number.isInteger(id) && id > 0);
+
+    if (orderIds.length === 0) {
+      return res.status(400).json({ message: "No valid orders selected" });
+    }
+
+    const orders = await prisma.order.findMany({
+      where: {
+        id: { in: orderIds },
+        shipperId: shipperIdNum,
+        invoiceId: null,
+        isDeleted: false,
+      },
     });
 
-    if (orders.length === 0) {
+    if (!orders.length) {
       return res
         .status(400)
         .json({ message: "No valid uninvoiced orders found" });
     }
 
-    if (orders.length !== selectedOrderIds.length) {
+    if (orders.length !== orderIds.length) {
       return res.status(400).json({
         message:
           "Some orders are already invoiced or do not belong to this shipper",
       });
     }
 
-    // Calculate totals
     let codTotal = 0;
     let serviceChargesTotal = 0;
 
-    for (let order of orders) {
+    // Also collect min/max dates from selected orders to use as a
+    // sensible default invoice period if parcelFrom/parcelTo are
+    // missing or invalid from the client.
+    let minOrderDate = null;
+    let maxOrderDate = null;
+
+    for (const order of orders) {
       codTotal += Number(order.codAmount || 0);
-      const serviceCharges = await calculateServiceCharges(order);
-      serviceChargesTotal += serviceCharges;
+      const svc = await calculateServiceCharges(order);
+      serviceChargesTotal += svc;
+
+      const baseDate = order.deliveredAt || order.createdAt;
+      if (baseDate instanceof Date && !Number.isNaN(baseDate.getTime())) {
+        if (!minOrderDate || baseDate < minOrderDate) minOrderDate = baseDate;
+        if (!maxOrderDate || baseDate > maxOrderDate) maxOrderDate = baseDate;
+      }
     }
 
     const numericWhtIt = Number(whtIt) || 0;
@@ -167,50 +344,73 @@ exports.createInvoice = async (req, res, next) => {
     const netPayable =
       codTotal + serviceChargesTotal - numericWhtIt - numericWhtSt;
 
-    // Generate invoice number
-    const invoiceNumber = await InvoiceCounter.getNextInvoiceNumber();
+    const creatorRawId = req.user && (req.user.id || req.user._id);
+    const creatorId = Number(creatorRawId);
+    if (!Number.isInteger(creatorId) || creatorId <= 0) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
-    // Create invoice
-    const invoice = new Invoice({
-      invoiceNumber,
-      shipper: shipperId,
-      accountName,
-      accountNumber: accountNumber || "",
-      invoiceDate: invoiceDate || new Date(),
-      parcelFrom: new Date(parcelFrom),
-      parcelTo: new Date(parcelTo),
-      orders: selectedOrderIds,
-      codTotal,
-      flyerChargesTotal: serviceChargesTotal,
-      serviceChargesTotal,
-      whtIt: numericWhtIt,
-      whtSt: numericWhtSt,
-      netPayable,
-      createdBy: req.user.id,
-    });
+    // Parse invoice and period dates safely
+    const invoiceDateObj = parseDateInput(invoiceDate) || new Date();
+    let parcelFromDate = parseDateInput(parcelFrom);
+    let parcelToDate = parseDateInput(parcelTo);
 
-    await invoice.save();
+    if (!parcelFromDate || !parcelToDate) {
+      if (minOrderDate && !parcelFromDate) parcelFromDate = new Date(minOrderDate);
+      if (maxOrderDate && !parcelToDate) parcelToDate = new Date(maxOrderDate);
+    }
 
-    // Update orders with invoice reference
-    await Order.updateMany(
-      { _id: { $in: selectedOrderIds } },
-      {
-        $set: {
-          invoice: invoice._id,
+    // Final fallbacks: never let invalid Date objects through to Prisma
+    if (!parcelFromDate) parcelFromDate = new Date(invoiceDateObj);
+    if (!parcelToDate) parcelToDate = new Date(invoiceDateObj);
+
+    const createdInvoice = await prisma.$transaction(async (tx) => {
+      const invoiceNumber = await allocateNextInvoiceNumber(tx);
+
+      const invoice = await tx.invoice.create({
+        data: {
+          invoiceNumber,
+          shipperId: shipperIdNum,
+          accountName,
+          accountNumber: accountNumber || "",
+          invoiceDate: invoiceDateObj,
+          parcelFrom: parcelFromDate,
+          parcelTo: parcelToDate,
+          codTotal,
+          flyerChargesTotal: serviceChargesTotal,
+          serviceChargesTotal,
+          whtIt: numericWhtIt,
+          whtSt: numericWhtSt,
+          netPayable,
+          createdById: creatorId,
+        },
+      });
+
+      await tx.order.updateMany({
+        where: { id: { in: orderIds } },
+        data: {
+          invoiceId: invoice.id,
           invoicedAt: new Date(),
         },
-      },
-    );
+      });
 
-    // Populate the saved invoice for response
-    const populatedInvoice = await Invoice.findById(invoice._id)
-      .populate("shipper", "name email companyName phone address")
-      .populate("orders")
-      .populate("createdBy", "name");
+      const fullInvoice = await tx.invoice.findUnique({
+        where: { id: invoice.id },
+        include: {
+          shipper: true,
+          orders: true,
+          createdBy: {
+            select: { id: true, name: true },
+          },
+        },
+      });
+
+      return fullInvoice;
+    });
 
     res.status(201).json({
       message: "Invoice created successfully",
-      invoice: populatedInvoice,
+      invoice: mapInvoice(createdInvoice),
     });
   } catch (error) {
     next(error);
@@ -221,17 +421,27 @@ exports.createInvoice = async (req, res, next) => {
 exports.getInvoice = async (req, res, next) => {
   try {
     const { id } = req.params;
+    const invoiceId = Number(id);
+    if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+      return res.status(400).json({ message: "Invalid invoice id" });
+    }
 
-    const invoice = await Invoice.findById(id)
-      .populate("shipper", "name email companyName phone address")
-      .populate("orders")
-      .populate("createdBy", "name");
+    const invoice = await prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      include: {
+        shipper: true,
+        orders: true,
+        createdBy: {
+          select: { id: true, name: true },
+        },
+      },
+    });
 
     if (!invoice) {
       return res.status(404).json({ message: "Invoice not found" });
     }
 
-    res.json(invoice);
+    res.json(mapInvoice(invoice));
   } catch (error) {
     next(error);
   }
@@ -242,32 +452,47 @@ exports.getInvoices = async (req, res, next) => {
   try {
     const { shipperId, from, to, page = 1, limit = 20 } = req.query;
 
-    const query = {};
+    const where = {};
 
     if (shipperId) {
-      query.shipper = shipperId;
+      const sid = Number(shipperId);
+      if (Number.isInteger(sid) && sid > 0) {
+        where.shipperId = sid;
+      }
     }
 
     if (from && to) {
-      query.invoiceDate = {
-        $gte: new Date(from),
-        $lte: new Date(to),
-      };
+      const fromDate = new Date(from);
+      const toDate = new Date(to);
+      if (!Number.isNaN(fromDate.getTime()) && !Number.isNaN(toDate.getTime())) {
+        where.invoiceDate = {
+          gte: fromDate,
+          lte: toDate,
+        };
+      }
     }
 
-    const invoices = await Invoice.find(query)
-      .populate("shipper", "name email companyName")
-      .populate("createdBy", "name")
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
+    const pageNum = Math.max(1, Number(page) || 1);
+    const limitNum = Math.min(100, Math.max(1, Number(limit) || 20));
 
-    const total = await Invoice.countDocuments(query);
+    const [total, invoices] = await Promise.all([
+      prisma.invoice.count({ where }),
+      prisma.invoice.findMany({
+        where,
+        include: {
+          shipper: true,
+          createdBy: { select: { id: true, name: true } },
+        },
+        orderBy: { createdAt: "desc" },
+        skip: (pageNum - 1) * limitNum,
+        take: limitNum,
+      }),
+    ]);
 
     res.json({
-      invoices,
-      totalPages: Math.ceil(total / limit),
-      currentPage: page,
+      invoices: invoices.map(mapInvoice),
+      totalPages: Math.ceil(total / limitNum) || 0,
+      currentPage: pageNum,
       total,
     });
   } catch (error) {
@@ -278,21 +503,8 @@ exports.getInvoices = async (req, res, next) => {
 // Get next invoice number (for preview)
 exports.getNextInvoiceNumber = async (req, res, next) => {
   try {
-    const nextNumber = await InvoiceCounter.getNextInvoiceNumber();
-
-    // Rollback the counter since this was just for preview
-    const today = new Date();
-    const dateStr =
-      today.getDate().toString().padStart(2, "0") +
-      (today.getMonth() + 1).toString().padStart(2, "0") +
-      today.getFullYear().toString().slice(-2);
-
-    await InvoiceCounter.findOneAndUpdate(
-      { date: dateStr },
-      { $inc: { counter: -1 } },
-    );
-
-    res.json({ invoiceNumber: nextNumber });
+    const invoiceNumber = await getNextInvoiceNumberPreviewInternal();
+    res.json({ invoiceNumber });
   } catch (error) {
     next(error);
   }
@@ -301,13 +513,12 @@ exports.getNextInvoiceNumber = async (req, res, next) => {
 // Get all shippers for dropdown
 exports.getShippers = async (req, res, next) => {
   try {
-    const shippers = await User.find(
-      { role: "SHIPPER" },
-      // Include structured bank fields so invoice UI can prefill account details
-      "name email companyName phone address bankName accountHolderName accountNumber iban",
-    ).sort({ name: 1 });
+    const shippers = await prisma.user.findMany({
+      where: { role: "SHIPPER" },
+      orderBy: { name: "asc" },
+    });
 
-    res.json(shippers);
+    res.json(shippers.map(mapShipperForInvoice));
   } catch (error) {
     next(error);
   }
@@ -317,12 +528,19 @@ exports.getShippers = async (req, res, next) => {
 exports.exportInvoiceToExcel = async (req, res, next) => {
   try {
     const { id } = req.params;
+    const invoiceId = Number(id);
+    if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+      return res.status(400).json({ message: "Invalid invoice id" });
+    }
 
-    // Fetch invoice with populated data
-    const invoice = await Invoice.findById(id)
-      .populate("shipper", "name email companyName phone address")
-      .populate("orders")
-      .populate("createdBy", "name");
+    const invoice = await prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      include: {
+        shipper: true,
+        orders: true,
+        createdBy: { select: { id: true, name: true } },
+      },
+    });
 
     if (!invoice) {
       return res.status(404).json({ message: "Invoice not found" });
@@ -362,7 +580,7 @@ exports.exportInvoiceToExcel = async (req, res, next) => {
     worksheet.getCell("F4").value = "Account Name:";
     worksheet.getCell("G4").value = invoice.accountName;
     worksheet.getCell("F5").value = "Account No:";
-    worksheet.getCell("G5").value = invoice.accountNumber;
+    worksheet.getCell("G5").value = invoice.accountNumber || "";
 
     // Period information
     worksheet.getCell("A6").value = "Period From:";

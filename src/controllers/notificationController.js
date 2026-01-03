@@ -1,26 +1,37 @@
-const Notification = require('../models/Notification');
-const Order = require('../models/Order');
-const User = require('../models/User');
+const prisma = require('../prismaClient');
 
+// Create a pickup request notification for a shipper
 exports.createPickupRequest = async (req, res, next) => {
   try {
     const { shipperId, message } = req.body;
-    
+
     if (!shipperId) {
       return res.status(400).json({ message: 'Shipper ID is required' });
     }
 
-    // Count pending parcels
-    const pendingParcels = await Order.countDocuments({
-      shipper: shipperId,
-      status: { $in: ['CREATED', 'ASSIGNED'] }
+    const shipperIdNum = Number(shipperId);
+    if (!Number.isInteger(shipperIdNum) || shipperIdNum <= 0) {
+      return res.status(400).json({ message: 'Invalid shipper ID' });
+    }
+
+    // Count pending parcels for this shipper
+    const pendingParcels = await prisma.order.count({
+      where: {
+        shipperId: shipperIdNum,
+        status: { in: ['CREATED', 'ASSIGNED'] },
+      },
     });
 
-    const notification = await Notification.create({
-      type: 'PICKUP_REQUEST',
-      shipper: shipperId,
-      message: message || 'Pickup required',
-      totalPendingParcels: pendingParcels
+    const notification = await prisma.notification.create({
+      data: {
+        type: 'PICKUP_REQUEST',
+        shipperId: shipperIdNum,
+        message: message || 'Pickup required',
+        totalPendingParcels: pendingParcels,
+      },
+      include: {
+        shipper: { select: { name: true, email: true } },
+      },
     });
 
     res.status(201).json(notification);
@@ -29,25 +40,30 @@ exports.createPickupRequest = async (req, res, next) => {
   }
 };
 
+// List notifications for the current user (CEO/MANAGER/SHIPPER)
 exports.getNotifications = async (req, res, next) => {
   try {
-    const { role } = req.user;
-    
-    let query = {};
+    const { role, id } = req.user;
+
+    let where = {};
     if (role === 'CEO' || role === 'MANAGER') {
-      // CEO and Manager see all pickup requests
-      query = { type: 'PICKUP_REQUEST', read: false };
+      // CEO and Manager see unread pickup requests
+      where = { type: 'PICKUP_REQUEST', read: false };
     } else if (role === 'SHIPPER') {
       // Shippers see their own notifications
-      query = { shipper: req.user.id };
+      where = { shipperId: id };
     } else {
       return res.json([]);
     }
 
-    const notifications = await Notification.find(query)
-      .populate('shipper', 'name email')
-      .sort({ createdAt: -1 })
-      .limit(50);
+    const notifications = await prisma.notification.findMany({
+      where,
+      include: {
+        shipper: { select: { name: true, email: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
 
     res.json(notifications);
   } catch (error) {
@@ -55,15 +71,20 @@ exports.getNotifications = async (req, res, next) => {
   }
 };
 
+// Mark a notification as read
 exports.markAsRead = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    const notification = await Notification.findByIdAndUpdate(
-      id,
-      { read: true, readAt: new Date() },
-      { new: true }
-    );
+    const notifId = Number(id);
+    if (!Number.isInteger(notifId) || notifId <= 0) {
+      return res.status(400).json({ message: 'Invalid notification id' });
+    }
+
+    const notification = await prisma.notification.update({
+      where: { id: notifId },
+      data: { read: true, readAt: new Date() },
+    });
 
     if (!notification) {
       return res.status(404).json({ message: 'Notification not found' });

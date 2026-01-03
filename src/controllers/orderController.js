@@ -1,10 +1,52 @@
-const Order = require('../models/Order');
-const CommissionConfig = require('../models/CommissionConfig');
-const FinancialTransaction = require('../models/FinancialTransaction');
-const RiderProfile = require('../models/RiderProfile');
+// Legacy Mongoose models are kept only for a few finance-related side effects.
+// Core order CRUD and listing logic has been migrated to Prisma.
+// const Order = require('../models/Order');
+// const CommissionConfig = require('../models/CommissionConfig');
+// const FinancialTransaction = require('../models/FinancialTransaction');
+// const RiderProfile = require('../models/RiderProfile');
 const generateBookingId = require('../config/bookingId');
 const generateTrackingId = require('../config/trackingId');
 const QRCode = require('qrcode');
+const prisma = require('../prismaClient');
+
+// Map Prisma Order + relations into the shape the React frontend expects
+function mapOrderToApi(order) {
+  if (!order) return null;
+
+  const { shipper, assignedRider, ...o } = order;
+
+  const base = {
+    ...o,
+    id: o.id,
+    _id: o.id,
+  };
+
+  if (shipper) {
+    base.shipper = {
+      _id: shipper.id,
+      id: shipper.id,
+      name: shipper.name,
+      email: shipper.email,
+      companyName: shipper.companyName,
+      phone: shipper.phone,
+    };
+  } else if (o.shipperId != null) {
+    base.shipper = o.shipperId;
+  }
+
+  if (assignedRider) {
+    base.assignedRider = {
+      _id: assignedRider.id,
+      id: assignedRider.id,
+      name: assignedRider.name,
+      phone: assignedRider.phone,
+    };
+  } else if (o.assignedRiderId != null) {
+    base.assignedRider = o.assignedRiderId;
+  }
+
+  return base;
+}
 
 /**
  * Create a new order (manual shipper flow)
@@ -21,57 +63,87 @@ const createOrder = async (req, res, next) => {
       return res.status(400).json({ message: 'weightKg required and must be > 0' });
     }
 
+    const shipperId = Number(req.user.id);
+    if (!Number.isInteger(shipperId) || shipperId <= 0) {
+      return res.status(400).json({ message: 'Invalid shipper id' });
+    }
+
     const bookingId = await generateBookingId();
     const trackingId = await generateTrackingId();
-    const shipperIdToUse = (process.env.DEFAULT_SHIPPER_ID && process.env.DEFAULT_SHIPPER_ID.length >= 10)
-      ? process.env.DEFAULT_SHIPPER_ID
-      : req.user.id;
 
-    // Commission Config/weight-based logic
-    let serviceCharges = 0;
-    const commissionConfig = await CommissionConfig.findOne({ shipper: shipperIdToUse });
+    // Commission Config/weight-based logic via Prisma
+    const commissionConfig = await prisma.commissionConfig.findUnique({
+      where: { shipperId },
+      include: { weightBrackets: true },
+    });
+
     if (!commissionConfig || !Array.isArray(commissionConfig.weightBrackets) || commissionConfig.weightBrackets.length === 0) {
-      return res.status(400).json({ message: 'No commission weight brackets configured for this shipper' });
+      return res
+        .status(400)
+        .json({ message: 'No commission weight brackets configured for this shipper' });
     }
-    // Find weight bracket
-    const bracketsSorted = commissionConfig.weightBrackets.slice().sort((a,b)=>a.minKg-b.minKg);
-    const matching = bracketsSorted.find(b => (weightKg >= b.minKg) && (b.maxKg === null || typeof b.maxKg==='undefined' || weightKg < b.maxKg));
+
+    const bracketsSorted = commissionConfig.weightBrackets
+      .slice()
+      .sort((a, b) => a.minKg - b.minKg);
+
+    const numericWeight = Number(weightKg);
+    const matching = bracketsSorted.find((b) => {
+      const withinMin = numericWeight >= b.minKg;
+      const withinMax = b.maxKg == null || numericWeight < b.maxKg;
+      return withinMin && withinMax;
+    });
+
     if (!matching) {
-      return res.status(400).json({ message: 'No weight bracket matched for this shipper' });
+      return res
+        .status(400)
+        .json({ message: 'No weight bracket matched for this shipper' });
     }
-    serviceCharges = matching.charge;
 
-    const orderData = {
-      bookingId,
-      trackingId,
-      shipper: shipperIdToUse,
-      consigneeName,
-      consigneePhone,
-      consigneeAddress,
-      destinationCity,
-      serviceType,
-      paymentType: paymentType || (Number(codAmount) > 0 ? 'COD' : 'ADVANCE'),
-      codAmount: paymentType === 'ADVANCE' ? 0 : Number(codAmount || 0),
-      productDescription,
-      pieces,
-      fragile,
-      weightKg: Number(weightKg),
-      serviceCharges,
-      totalAmount: (paymentType === 'ADVANCE' ? 0 : Number(codAmount || 0)) + serviceCharges,
-      remarks,
-      status: 'CREATED',
-      statusHistory: [{
-        status: 'CREATED', updatedBy: req.user.id, note: 'Order created by shipper'
-      }],
-      isIntegrated: false,
-      bookingState: 'BOOKED',
-      source: 'MANUAL',
-      bookedWithLLL: true
-    };
+    const serviceCharges = matching.chargePkr;
 
-    const order = new Order(orderData);
-    const savedOrder = await order.save();
-    res.status(201).json(savedOrder);
+    const numericCod = Number(codAmount || 0);
+    const effectivePaymentType = paymentType || (numericCod > 0 ? 'COD' : 'ADVANCE');
+    const effectiveCodAmount = effectivePaymentType === 'ADVANCE' ? 0 : numericCod;
+
+    const created = await prisma.order.create({
+      data: {
+        bookingId,
+        trackingId,
+        shipperId,
+        consigneeName,
+        consigneePhone,
+        consigneeAddress,
+        destinationCity,
+        serviceType: serviceType || 'SAME_DAY',
+        paymentType: effectivePaymentType,
+        codAmount: effectiveCodAmount,
+        productDescription,
+        pieces: Number(pieces || 1),
+        fragile: !!fragile,
+        weightKg: numericWeight,
+        serviceCharges,
+        totalAmount: effectiveCodAmount + serviceCharges,
+        remarks,
+        status: 'CREATED',
+        isIntegrated: false,
+        bookingState: 'BOOKED',
+        bookedWithLLL: true,
+        isDeleted: false,
+        shipperApprovalStatus: 'approved',
+        source: 'MANUAL',
+      },
+      include: {
+        shipper: {
+          select: { id: true, name: true, email: true, companyName: true, phone: true },
+        },
+        assignedRider: {
+          select: { id: true, name: true, phone: true },
+        },
+      },
+    });
+
+    res.status(201).json(mapOrderToApi(created));
   } catch (err) {
     next(err);
   }
@@ -82,44 +154,62 @@ const getOrders = async (req, res, next) => {
     const { role, id } = req.user;
     const { status, from, to, q } = req.query;
 
-    let query = {};
+    const where = { isDeleted: false };
 
     if (role === 'SHIPPER') {
-      query.shipper = id;
+      where.shipperId = id;
     } else if (role === 'RIDER') {
-      query.assignedRider = id;
-      query.bookingState = 'BOOKED';
+      where.assignedRiderId = id;
+      where.bookingState = 'BOOKED';
     } else if (['CEO', 'MANAGER'].includes(role)) {
-      query.$or = [
-        { isIntegrated: { $ne: true } },
-        { isIntegrated: true, bookingState: 'BOOKED' }
+      where.OR = [
+        { isIntegrated: false },
+        { isIntegrated: true, bookingState: 'BOOKED' },
       ];
     }
 
     if (status) {
-      query.status = status;
+      where.status = status;
     }
 
     if (from || to) {
-      query.createdAt = {};
-      if (from) query.createdAt.$gte = new Date(from);
-      if (to) query.createdAt.$lte = new Date(to);
+      const createdAt = {};
+      if (from) {
+        const d = new Date(from);
+        if (!Number.isNaN(d.getTime())) createdAt.gte = d;
+      }
+      if (to) {
+        const d = new Date(to);
+        if (!Number.isNaN(d.getTime())) createdAt.lte = d;
+      }
+      if (Object.keys(createdAt).length) {
+        where.createdAt = createdAt;
+      }
     }
 
     if (q && q.trim()) {
       const searchId = q.trim();
-      query.$or = [
+      // For search, override visibility logic like the legacy Mongo query did
+      where.OR = [
         { bookingId: searchId },
-        { trackingId: searchId }
+        { trackingId: searchId },
       ];
     }
 
-    const orders = await Order.find(query)
-      .populate('shipper', 'name email companyName')
-      .populate('assignedRider', 'name phone')
-      .sort({ createdAt: -1 });
+    const orders = await prisma.order.findMany({
+      where,
+      include: {
+        shipper: {
+          select: { id: true, name: true, email: true, companyName: true, phone: true },
+        },
+        assignedRider: {
+          select: { id: true, name: true, phone: true },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
 
-    res.json(orders);
+    res.json(orders.map(mapOrderToApi));
   } catch (error) {
     next(error);
   }
@@ -133,23 +223,42 @@ const getManagerOverview = async (req, res, next) => {
     end.setHours(23, 59, 59, 999);
 
     const visibility = {
-      $or: [
-        { isIntegrated: { $ne: true } },
-        { isIntegrated: true, bookingState: 'BOOKED' }
-      ]
+      OR: [
+        { isIntegrated: false },
+        { isIntegrated: true, bookingState: 'BOOKED' },
+      ],
     };
 
-    const todayFilter = { createdAt: { $gte: start, $lte: end }, ...visibility };
+    const todayFilter = {
+      createdAt: { gte: start, lte: end },
+      ...visibility,
+    };
 
-    const todayReceived = await Order.countDocuments(todayFilter);
-    const todayBooked = await Order.countDocuments({ ...todayFilter, assignedRider: { $ne: null } });
-    const todayUnbooked = await Order.countDocuments({ ...todayFilter, assignedRider: null });
-
-    const warehouseCount = await Order.countDocuments({ status: 'ASSIGNED', ...visibility });
-    const outForDeliveryCount = await Order.countDocuments({ status: 'OUT_FOR_DELIVERY', ...visibility });
-    const returnedCount = await Order.countDocuments({ status: 'RETURNED', ...visibility });
-
-    const pendingReviewCountAgg = await FinancialTransaction.countDocuments({ settlementStatus: 'PENDING' });
+    const [
+      todayReceived,
+      todayBooked,
+      todayUnbooked,
+      warehouseCount,
+      outForDeliveryCount,
+      returnedCount,
+      pendingReviewCountAgg,
+    ] = await Promise.all([
+      prisma.order.count({ where: todayFilter }),
+      prisma.order.count({
+        where: { ...todayFilter, assignedRiderId: { not: null } },
+      }),
+      prisma.order.count({ where: { ...todayFilter, assignedRiderId: null } }),
+      prisma.order.count({
+        where: { status: 'ASSIGNED', ...visibility },
+      }),
+      prisma.order.count({
+        where: { status: 'OUT_FOR_DELIVERY', ...visibility },
+      }),
+      prisma.order.count({ where: { status: 'RETURNED', ...visibility } }),
+      prisma.financialTransaction.count({
+        where: { settlementStatus: 'PENDING' },
+      }),
+    ]);
 
     res.json({
       todayReceived,
@@ -158,7 +267,7 @@ const getManagerOverview = async (req, res, next) => {
       warehouseCount,
       outForDeliveryCount,
       returnedCount,
-      deliveryUnderReviewCount: pendingReviewCountAgg
+      deliveryUnderReviewCount: pendingReviewCountAgg,
     });
   } catch (error) {
     next(error);
@@ -167,25 +276,32 @@ const getManagerOverview = async (req, res, next) => {
 
 const getOrderById = async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const order = await Order.findById(id)
-      .populate('shipper', 'name email')
-      .populate('assignedRider', 'name phone');
+    const rawId = req.params.id;
+    const orderId = Number(rawId);
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      return res.status(400).json({ message: 'Invalid order id' });
+    }
+
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: {
+        shipper: { select: { id: true, name: true, email: true, companyName: true } },
+        assignedRider: { select: { id: true, name: true, phone: true } },
+      },
+    });
+
     if (!order) return res.status(404).json({ message: 'Order not found' });
 
     const userId = req.user.id;
     const role = req.user.role;
-    if (role === 'SHIPPER' && order.shipper._id.toString() !== userId) {
+    if (role === 'SHIPPER' && order.shipperId !== userId) {
       return res.status(403).json({ message: 'Forbidden' });
     }
-    const assignedId = typeof order.assignedRider === 'object' && order.assignedRider !== null
-      ? order.assignedRider._id?.toString()
-      : order.assignedRider?.toString();
-    if (role === 'RIDER' && assignedId !== userId) {
+    if (role === 'RIDER' && order.assignedRiderId !== userId) {
       return res.status(403).json({ message: 'Forbidden' });
     }
 
-    res.json(order);
+    res.json(mapOrderToApi(order));
   } catch (error) {
     next(error);
   }
@@ -193,36 +309,50 @@ const getOrderById = async (req, res, next) => {
 
 const assignRider = async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const { riderId } = req.body;
+    const rawId = req.params.id;
+    const orderId = Number(rawId);
+    const riderIdNum = req.body.riderId ? Number(req.body.riderId) : null;
 
-    const order = await Order.findById(id);
-    if (!order) {
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      return res.status(400).json({ message: 'Invalid order id' });
+    }
+
+    if (riderIdNum !== null && (!Number.isInteger(riderIdNum) || riderIdNum <= 0)) {
+      return res.status(400).json({ message: 'Invalid rider id' });
+    }
+
+    const existing = await prisma.order.findUnique({ where: { id: orderId } });
+    if (!existing) {
       return res.status(404).json({ message: 'Order not found' });
     }
 
-    const previousRider = order.assignedRider;
-    order.assignedRider = riderId || null;
+    const previousRiderId = existing.assignedRiderId;
+    const nextStatus =
+      riderIdNum && existing.status === 'CREATED' ? 'ASSIGNED' : existing.status;
 
-    if (riderId && order.status === 'CREATED') {
-      order.status = 'ASSIGNED';
-    }
-
-    order.statusHistory.push({
-      status: order.status,
-      updatedBy: req.user.id,
-      note: riderId
-        ? `Assigned to rider ${riderId}`
-        : `Unassigned from rider ${previousRider}`
+    const updated = await prisma.order.update({
+      where: { id: orderId },
+      data: {
+        assignedRiderId: riderIdNum,
+        status: nextStatus,
+        statusEvents: {
+          create: {
+            status: nextStatus,
+            note:
+              riderIdNum != null
+                ? `Assigned to rider ${riderIdNum}`
+                : `Unassigned from rider ${previousRiderId ?? ''}`,
+            createdById: Number(req.user.id) || null,
+          },
+        },
+      },
+      include: {
+        shipper: { select: { id: true, name: true, email: true, companyName: true } },
+        assignedRider: { select: { id: true, name: true, phone: true } },
+      },
     });
 
-    await order.save();
-
-    const updatedOrder = await Order.findById(id)
-      .populate('shipper', 'name')
-      .populate('assignedRider', 'name');
-
-    res.json(updatedOrder);
+    res.json(mapOrderToApi(updated));
   } catch (error) {
     next(error);
   }
@@ -230,39 +360,41 @@ const assignRider = async (req, res, next) => {
 
 const createFinancialTransaction = async (order) => {
   try {
-    const existing = await FinancialTransaction.findOne({ order: order._id });
-
     const isDelivered = order.status === 'DELIVERED';
-    const cod = isDelivered ? (order.amountCollected || order.codAmount || 0) : 0;
+    const cod = isDelivered ? Number(order.amountCollected ?? order.codAmount ?? 0) : 0;
 
-    const config = await CommissionConfig.findOne({ shipper: order.shipper });
+    if (!isDelivered || cod <= 0) {
+      return;
+    }
+
+    const cfg = await prisma.commissionConfig.findUnique({ where: { shipperId: order.shipperId } });
+
     let companyCommission = 0;
-    if (isDelivered && config) {
-      if (config.type === 'PERCENTAGE') {
-        companyCommission = (cod * config.value) / 100;
+    if (cfg) {
+      if (cfg.type === 'PERCENTAGE') {
+        companyCommission = Math.round((cod * cfg.value) / 100);
       } else {
-        companyCommission = config.value;
+        companyCommission = cfg.value;
       }
     }
 
     let riderCommission = 0;
-    if (order.assignedRider) {
-      const riderCfgModel = require('../models/RiderCommissionConfig');
-      const riderCfg = await riderCfgModel.findOne({ rider: order.assignedRider });
+    if (order.assignedRiderId) {
+      const riderCfg = await prisma.riderCommissionConfig.findUnique({
+        where: { riderId: order.assignedRiderId },
+        include: { rules: true },
+      });
       if (riderCfg) {
-        let rule;
-        if (Array.isArray(riderCfg.rules) && riderCfg.rules.length) {
-          rule = riderCfg.rules.find(r => r.status === order.status);
-        }
+        let rule = riderCfg.rules.find((r) => r.status === 'DELIVERED');
         if (rule) {
           if (rule.type === 'PERCENTAGE') {
-            riderCommission = (cod * rule.value) / 100;
+            riderCommission = Math.round((cod * rule.value) / 100);
           } else {
             riderCommission = rule.value;
           }
-        } else if (riderCfg.type && riderCfg.value !== undefined) {
+        } else if (riderCfg.type && riderCfg.value != null) {
           if (riderCfg.type === 'PERCENTAGE') {
-            riderCommission = (cod * riderCfg.value) / 100;
+            riderCommission = Math.round((cod * riderCfg.value) / 100);
           } else {
             riderCommission = riderCfg.value;
           }
@@ -274,77 +406,79 @@ const createFinancialTransaction = async (order) => {
     riderCommission = Math.min(riderCommission, cod);
     const shipperShare = cod - companyCommission;
 
-    const payload = {
-      order: order._id,
-      shipper: order.shipper,
-      rider: order.assignedRider,
-      totalCodCollected: cod,
-      shipperShare: shipperShare,
-      companyCommission: companyCommission,
-      riderCommission: riderCommission,
-      settlementStatus: 'PENDING'
-    };
-
-    if (existing) {
-      await FinancialTransaction.updateOne({ _id: existing._id }, payload);
-    } else {
-      await FinancialTransaction.create(payload);
-    }
+    await prisma.financialTransaction.upsert({
+      where: { orderId: order.id },
+      update: {
+        shipperId: order.shipperId,
+        riderId: order.assignedRiderId ?? null,
+        totalCodCollected: cod,
+        shipperShare,
+        companyCommission,
+        riderCommission,
+      },
+      create: {
+        orderId: order.id,
+        shipperId: order.shipperId,
+        riderId: order.assignedRiderId ?? null,
+        totalCodCollected: cod,
+        shipperShare,
+        companyCommission,
+        riderCommission,
+      },
+    });
   } catch (err) {
-    console.error('Error creating financial transaction:', err);
+    console.error('Error creating financial transaction (prisma):', err);
   }
 };
 
 const updateRiderFinance = async (order) => {
   try {
-    if (!order.assignedRider) return;
+    if (!order.assignedRiderId) return;
 
-    const riderProfile = await RiderProfile.findOne({ user: order.assignedRider });
+    const riderProfile = await prisma.riderProfile.findUnique({
+      where: { userId: order.assignedRiderId },
+    });
+
+    const cod = Number(order.amountCollected ?? order.codAmount ?? 0);
+    const svc = Number(order.serviceCharges ?? 0);
+
     if (!riderProfile) {
-      await RiderProfile.create({
-        user: order.assignedRider,
-        codCollected: order.amountCollected || order.codAmount || 0,
-        serviceCharges: order.serviceCharges || 0,
-        serviceChargeStatus: 'unpaid'
+      await prisma.riderProfile.create({
+        data: {
+          userId: order.assignedRiderId,
+          codCollected: cod,
+          serviceCharges: svc,
+          serviceChargeStatus: 'unpaid',
+        },
       });
       return;
     }
 
+    const updateData = {
+      codCollected: riderProfile.codCollected + cod,
+    };
+
     if (riderProfile.serviceChargeStatus === 'unpaid') {
-      riderProfile.codCollected += (order.amountCollected || order.codAmount || 0);
-      riderProfile.serviceCharges += (order.serviceCharges || 0);
-      await riderProfile.save();
-    } else {
-      riderProfile.codCollected += (order.amountCollected || order.codAmount || 0);
-      await riderProfile.save();
+      updateData.serviceCharges = (riderProfile.serviceCharges || 0) + svc;
     }
+
+    await prisma.riderProfile.update({
+      where: { id: riderProfile.id },
+      data: updateData,
+    });
   } catch (err) {
-    console.error('Error updating rider finance:', err);
+    console.error('Error updating rider finance (prisma):', err);
   }
 };
 
 const updateStatus = async (req, res, next) => {
   try {
-    const { id } = req.params;
+    const rawId = req.params.id;
+    const orderId = Number(rawId);
     const { status, amountCollected, reason } = req.body;
 
-    const order = await Order.findById(id);
-    if (!order) {
-      return res.status(404).json({ message: 'Order not found' });
-    }
-
-    // Restrict RIDER: can only update status for orders assigned to them
-    if (req.user.role === 'RIDER') {
-      const assignedRiderId = order.assignedRider 
-        ? (order.assignedRider._id ? order.assignedRider._id.toString() : order.assignedRider.toString())
-        : null;
-      const riderId = req.user.id || req.user._id;
-      
-      if (!assignedRiderId || assignedRiderId !== riderId.toString()) {
-        return res.status(403).json({ 
-          message: 'You can only update status for orders assigned to you' 
-        });
-      }
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      return res.status(400).json({ message: 'Invalid order id' });
     }
 
     const validStatuses = [
@@ -354,44 +488,72 @@ const updateStatus = async (req, res, next) => {
       'FAILED',
       'FIRST_ATTEMPT',
       'SECOND_ATTEMPT',
-      'THIRD_ATTEMPT'
+      'THIRD_ATTEMPT',
     ];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ message: 'Invalid status for update' });
     }
 
-    const previousStatus = order.status;
-    order.status = status;
-
-    if (status === 'DELIVERED') {
-      order.deliveredAt = Date.now();
-      const parsed = Number(amountCollected);
-      if (!isNaN(parsed) && parsed >= 0) {
-        order.amountCollected = parsed;
-      } else {
-        order.amountCollected = order.codAmount;
-      }
-    } else if (status === 'FAILED' || status === 'RETURNED') {
-      order.failedReason = reason;
-    }
-
-    order.statusHistory.push({
-      status: status,
-      updatedBy: req.user.id,
-      note: reason || `Status updated to ${status}`
+    const existing = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: { shipper: true, assignedRider: true },
     });
 
-    await order.save();
+    if (!existing) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
 
-    if (['DELIVERED', 'RETURNED', 'FAILED'].includes(status) && previousStatus !== status) {
-      await createFinancialTransaction(order);
-
-      if (order.assignedRider && status === 'DELIVERED') {
-        await updateRiderFinance(order);
+    if (req.user.role === 'RIDER') {
+      if (!existing.assignedRiderId || existing.assignedRiderId !== req.user.id) {
+        return res.status(403).json({
+          message: 'You can only update status for orders assigned to you',
+        });
       }
     }
 
-    res.json(order);
+    const previousStatus = existing.status;
+
+    const data = {
+      status,
+    };
+
+    let amountToSet = existing.amountCollected;
+    if (status === 'DELIVERED') {
+      const parsed = Number(amountCollected);
+      amountToSet = !Number.isNaN(parsed) && parsed >= 0 ? parsed : existing.codAmount;
+      data.deliveredAt = new Date();
+      data.amountCollected = amountToSet;
+    } else if (status === 'FAILED' || status === 'RETURNED') {
+      data.failedReason = reason;
+    }
+
+    const updated = await prisma.order.update({
+      where: { id: orderId },
+      data: {
+        ...data,
+        statusEvents: {
+          create: {
+            status,
+            note: reason || `Status updated to ${status}`,
+            createdById: Number(req.user.id) || null,
+          },
+        },
+      },
+      include: {
+        shipper: true,
+        assignedRider: true,
+      },
+    });
+
+    if (['DELIVERED', 'RETURNED', 'FAILED'].includes(status) && previousStatus !== status) {
+      await createFinancialTransaction(updated);
+
+      if (updated.assignedRiderId && status === 'DELIVERED') {
+        await updateRiderFinance(updated);
+      }
+    }
+
+    res.json(mapOrderToApi(updated));
   } catch (error) {
     next(error);
   }
@@ -399,9 +561,18 @@ const updateStatus = async (req, res, next) => {
 
 const getLabel = async (req, res, next) => {
   try {
-    const { id } = req.params;
+    const rawId = req.params.id;
+    const orderId = Number(rawId);
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      return res.status(400).json({ message: 'Invalid order id' });
+    }
 
-    const order = await Order.findById(id).populate('shipper', 'name companyName');
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: {
+        shipper: { select: { id: true, name: true, companyName: true } },
+      },
+    });
 
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
@@ -410,10 +581,10 @@ const getLabel = async (req, res, next) => {
     const userId = req.user.id;
     const role = req.user.role;
 
-    if (role === 'SHIPPER' && order.shipper._id.toString() !== userId) {
+    if (role === 'SHIPPER' && order.shipperId !== userId) {
       return res.status(403).json({ message: 'Forbidden' });
     }
-    if (role === 'RIDER' && order.assignedRider?.toString() !== userId) {
+    if (role === 'RIDER' && order.assignedRiderId !== userId) {
       return res.status(403).json({ message: 'Forbidden' });
     }
 
@@ -424,12 +595,12 @@ const getLabel = async (req, res, next) => {
         name: order.consigneeName,
         phone: order.consigneePhone,
         address: order.consigneeAddress,
-        destinationCity: order.destinationCity
+        destinationCity: order.destinationCity,
       },
       shipper: {
-        name: order.shipper.name,
-        companyName: order.shipper.companyName || 'N/A',
-        serviceType: order.serviceType
+        name: order.shipper?.name || 'N/A',
+        companyName: order.shipper?.companyName || 'N/A',
+        serviceType: order.serviceType,
       },
       order: {
         codAmount: order.codAmount,
@@ -438,8 +609,8 @@ const getLabel = async (req, res, next) => {
         productDescription: order.productDescription,
         pieces: order.pieces,
         fragile: order.fragile,
-        createdAt: order.createdAt
-      }
+        createdAt: order.createdAt,
+      },
     };
 
     res.json(labelData);
@@ -452,33 +623,45 @@ const getLabels = async (req, res, next) => {
   try {
     const { ids } = req.query;
     if (!ids) return res.status(400).json({ message: 'ids query is required' });
-    const idList = ids.split(',').map(s => s.trim()).filter(Boolean);
-    if (idList.length === 0) return res.status(400).json({ message: 'No ids provided' });
+    const idList = ids
+      .split(',')
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isInteger(n) && n > 0);
+    if (idList.length === 0) {
+      return res.status(400).json({ message: 'No ids provided' });
+    }
 
-    const orders = await Order.find({ _id: { $in: idList } }).populate('shipper', 'name companyName').lean();
-    if (!orders || orders.length === 0) return res.status(404).json({ message: 'Orders not found' });
+    const orders = await prisma.order.findMany({
+      where: { id: { in: idList } },
+      include: { shipper: { select: { id: true, name: true, companyName: true } } },
+    });
+
+    if (!orders || orders.length === 0) {
+      return res.status(404).json({ message: 'Orders not found' });
+    }
 
     const userId = req.user.id;
     const role = req.user.role;
-    const permitted = orders.filter(order => {
-      if (role === 'SHIPPER') return order.shipper && String(order.shipper._id || order.shipper) === userId;
-      if (role === 'RIDER') return String(order.assignedRider || '') === userId;
+
+    const permitted = orders.filter((order) => {
+      if (role === 'SHIPPER') return order.shipperId === userId;
+      if (role === 'RIDER') return order.assignedRiderId === userId;
       return true;
     });
 
-    const labels = permitted.map(order => ({
+    const labels = permitted.map((order) => ({
       bookingId: order.bookingId,
       trackingId: order.trackingId,
       consignee: {
         name: order.consigneeName,
         phone: order.consigneePhone,
         address: order.consigneeAddress,
-        destinationCity: order.destinationCity
+        destinationCity: order.destinationCity,
       },
       shipper: {
         name: order.shipper?.name || 'N/A',
         companyName: order.shipper?.companyName || 'N/A',
-        serviceType: order.serviceType
+        serviceType: order.serviceType,
       },
       order: {
         codAmount: order.codAmount,
@@ -487,8 +670,8 @@ const getLabels = async (req, res, next) => {
         productDescription: order.productDescription,
         pieces: order.pieces,
         fragile: order.fragile,
-        createdAt: order.createdAt
-      }
+        createdAt: order.createdAt,
+      },
     }));
 
     res.json({ count: labels.length, labels });
@@ -500,12 +683,14 @@ const getLabels = async (req, res, next) => {
 const printLabelsHtml = async (req, res, next) => {
   try {
     const shipperId = req.user.id;
-    const ids = Array.isArray(req.body.orderIds) ? req.body.orderIds : [];
+    const rawIds = Array.isArray(req.body.orderIds) ? req.body.orderIds : [];
+    const ids = rawIds.map((s) => Number(String(s))).filter((n) => Number.isInteger(n) && n > 0);
     if (!ids.length) return res.status(400).send('No orderIds provided');
 
-    const orders = await Order.find({ _id: { $in: ids }, shipper: shipperId })
-      .populate('shipper', 'name companyName')
-      .lean();
+    const orders = await prisma.order.findMany({
+      where: { id: { in: ids }, shipperId },
+      include: { shipper: { select: { name: true, companyName: true, phone: true, pickupAddress: true } } },
+    });
     if (!orders.length) return res.status(404).send('Orders not found');
 
     const patterns = {
@@ -780,29 +965,43 @@ const printLabelsHtml = async (req, res, next) => {
  */
 const bookOrder = async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const order = await Order.findById(id);
+    const rawId = req.params.id;
+    const orderId = Number(rawId);
+
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      return res.status(400).json({ message: 'Invalid order id' });
+    }
+
+    const order = await prisma.order.findUnique({ where: { id: orderId } });
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
     }
-    if (order.shipper.toString() !== req.user.id) {
+
+    if (order.shipperId !== req.user.id) {
       return res.status(403).json({ message: 'Not authorized to book this order' });
     }
+
     if (!order.isIntegrated || order.bookingState !== 'UNBOOKED') {
-      return res.status(400).json({ 
-        message: 'Only unbooked integrated orders can be booked' 
+      return res.status(400).json({
+        message: 'Only unbooked integrated orders can be booked',
       });
     }
-    
-    order.bookingState = 'BOOKED';
-    order.statusHistory.push({
-      status: order.status,
-      updatedBy: req.user.id,
-      note: 'Order booked by shipper'
+
+    const updated = await prisma.order.update({
+      where: { id: orderId },
+      data: {
+        bookingState: 'BOOKED',
+        statusEvents: {
+          create: {
+            status: order.status,
+            note: 'Order booked by shipper',
+            createdById: Number(req.user.id) || null,
+          },
+        },
+      },
     });
-    
-    const updatedOrder = await order.save();
-    res.json(updatedOrder);
+
+    res.json(mapOrderToApi(updated));
   } catch (error) {
     next(error);
   }
@@ -817,14 +1016,15 @@ const bookOrder = async (req, res, next) => {
 const assignByScan = async (req, res, next) => {
   try {
     const { bookingId, assignedRiderId } = req.body;
-    const assignedBy = req.user.id || req.user._id;
     const assignedByRole = req.user.role;
+    const assignedById = Number(req.user.id) || null;
 
     if (!bookingId || !bookingId.trim()) {
       return res.status(400).json({ message: 'bookingId is required' });
     }
 
-    if (!assignedRiderId) {
+    const riderIdNum = Number(assignedRiderId);
+    if (!Number.isInteger(riderIdNum) || riderIdNum <= 0) {
       return res.status(400).json({ message: 'assignedRiderId is required' });
     }
 
@@ -837,26 +1037,26 @@ const assignByScan = async (req, res, next) => {
       }
     }
 
-    // Find order
-    const order = await Order.findOne({ bookingId: extractedBookingId })
-      .populate('shipper', 'name email')
-      .populate('assignedRider', 'name email');
+    const order = await prisma.order.findUnique({
+      where: { bookingId: extractedBookingId },
+      include: {
+        shipper: { select: { id: true, name: true, email: true } },
+        assignedRider: { select: { id: true, name: true, email: true } },
+      },
+    });
 
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
     }
 
-    // Validate order is eligible for assignment
     const finalStates = ['DELIVERED', 'RETURNED', 'FAILED'];
     if (finalStates.includes(order.status)) {
-      return res.status(400).json({ 
-        message: `Cannot assign order. Order is already ${order.status}` 
+      return res.status(400).json({
+        message: `Cannot assign order. Order is already ${order.status}`,
       });
     }
 
-    // Validate rider exists and is a RIDER
-    const User = require('../models/User');
-    const rider = await User.findById(assignedRiderId);
+    const rider = await prisma.user.findUnique({ where: { id: riderIdNum } });
     if (!rider) {
       return res.status(404).json({ message: 'Rider not found' });
     }
@@ -867,25 +1067,29 @@ const assignByScan = async (req, res, next) => {
       return res.status(400).json({ message: 'Rider is not active' });
     }
 
-    // Assign order to rider
-    const previousRider = order.assignedRider;
-    order.assignedRider = assignedRiderId;
-    order.status = 'OUT_FOR_DELIVERY';
-    order.outForDeliveryAt = new Date();
-    
-    // Add status history entry
-    order.statusHistory.push({
-      status: 'OUT_FOR_DELIVERY',
-      timestamp: new Date(),
-      updatedBy: assignedBy,
-      note: `Assigned to rider ${rider.name} by ${assignedByRole} via QR scan`
+    const updated = await prisma.order.update({
+      where: { id: order.id },
+      data: {
+        assignedRiderId: riderIdNum,
+        status: 'OUT_FOR_DELIVERY',
+        outForDeliveryAt: new Date(),
+        statusEvents: {
+          create: {
+            status: 'OUT_FOR_DELIVERY',
+            note: `Assigned to rider ${rider.name} by ${assignedByRole} via QR scan`,
+            createdById: assignedById,
+          },
+        },
+      },
+      include: {
+        shipper: { select: { id: true, name: true, email: true } },
+        assignedRider: { select: { id: true, name: true, email: true, phone: true } },
+      },
     });
-
-    const updatedOrder = await order.save();
 
     res.json({
       message: `Order assigned to ${rider.name} and marked Out for Delivery`,
-      order: updatedOrder
+      order: mapOrderToApi(updated),
     });
   } catch (error) {
     next(error);
@@ -894,21 +1098,23 @@ const assignByScan = async (req, res, next) => {
 
 const getPendingIntegratedOrdersForShipper = async (req, res, next) => {
   try {
-    const shipperId = req.user.id || req.user._id;
+    const shipperId = req.user.id;
     if (!shipperId) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const orders = await Order.find({
-      shipper: shipperId,
-      isIntegrated: true,
-      bookingState: 'UNBOOKED',
-      isDeleted: { $ne: true },
-      shipperApprovalStatus: 'pending',
-    })
-      .sort({ createdAt: -1 });
+    const orders = await prisma.order.findMany({
+      where: {
+        shipperId,
+        isIntegrated: true,
+        bookingState: 'UNBOOKED',
+        isDeleted: false,
+        shipperApprovalStatus: 'pending',
+      },
+      orderBy: { createdAt: 'desc' },
+    });
 
-    res.json(orders);
+    res.json(orders.map(mapOrderToApi));
   } catch (error) {
     next(error);
   }
@@ -916,32 +1122,46 @@ const getPendingIntegratedOrdersForShipper = async (req, res, next) => {
 
 const rejectIntegratedOrder = async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const shipperId = req.user.id || req.user._id;
+    const rawId = req.params.id;
+    const orderId = Number(rawId);
+    const shipperId = req.user.id;
 
-    const order = await Order.findOne({
-      _id: id,
-      shipper: shipperId,
-      isIntegrated: true,
-      bookingState: 'UNBOOKED',
-      isDeleted: { $ne: true },
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      return res.status(400).json({ message: 'Invalid order id' });
+    }
+
+    const order = await prisma.order.findFirst({
+      where: {
+        id: orderId,
+        shipperId,
+        isIntegrated: true,
+        bookingState: 'UNBOOKED',
+        isDeleted: false,
+      },
     });
 
     if (!order) {
-      return res.status(404).json({ message: 'Order not found or not eligible for rejection' });
+      return res
+        .status(404)
+        .json({ message: 'Order not found or not eligible for rejection' });
     }
 
-    order.isDeleted = true;
-    order.shipperApprovalStatus = 'rejected';
-    order.statusHistory.push({
-      status: order.status,
-      updatedBy: shipperId,
-      note: 'Integrated order rejected by shipper',
+    const updated = await prisma.order.update({
+      where: { id: orderId },
+      data: {
+        isDeleted: true,
+        shipperApprovalStatus: 'rejected',
+        statusEvents: {
+          create: {
+            status: order.status,
+            note: 'Integrated order rejected by shipper',
+            createdById: shipperId,
+          },
+        },
+      },
     });
 
-    const updated = await order.save();
-
-    res.json(updated);
+    res.json(mapOrderToApi(updated));
   } catch (error) {
     next(error);
   }
@@ -955,14 +1175,13 @@ const rejectIntegratedOrder = async (req, res, next) => {
 const getOrderDetailsByBookingId = async (req, res, next) => {
   try {
     const { bookingId } = req.params;
-    const userId = req.user.id || req.user._id;
+    const userId = req.user.id;
     const userRole = req.user.role;
 
     if (!bookingId || !bookingId.trim()) {
       return res.status(400).json({ message: 'bookingId is required' });
     }
 
-    // Extract bookingId from QR format if present
     let extractedBookingId = bookingId.trim();
     if (extractedBookingId.includes('|')) {
       const parts = extractedBookingId.split('|');
@@ -971,29 +1190,27 @@ const getOrderDetailsByBookingId = async (req, res, next) => {
       }
     }
 
-    // Find order
-    const order = await Order.findOne({ bookingId: extractedBookingId })
-      .populate('shipper', 'name email')
-      .populate('assignedRider', 'name email phone');
+    const order = await prisma.order.findUnique({
+      where: { bookingId: extractedBookingId },
+      include: {
+        assignedRider: {
+          select: { id: true, name: true, email: true, phone: true },
+        },
+      },
+    });
 
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
     }
 
-    // RIDER can only view orders assigned to them
     if (userRole === 'RIDER') {
-      const assignedRiderId = order.assignedRider 
-        ? (order.assignedRider._id ? order.assignedRider._id.toString() : order.assignedRider.toString())
-        : null;
-      
-      if (!assignedRiderId || assignedRiderId !== userId.toString()) {
-        return res.status(403).json({ 
-          message: 'You can only view orders assigned to you' 
+      if (!order.assignedRiderId || order.assignedRiderId !== userId) {
+        return res.status(403).json({
+          message: 'You can only view orders assigned to you',
         });
       }
     }
 
-    // Return order details (read-only, no sensitive data)
     res.json({
       bookingId: order.bookingId,
       trackingId: order.trackingId,
@@ -1003,18 +1220,21 @@ const getOrderDetailsByBookingId = async (req, res, next) => {
       destinationCity: order.destinationCity,
       codAmount: order.codAmount,
       status: order.status,
-      assignedRider: order.assignedRider ? {
-        _id: order.assignedRider._id || order.assignedRider,
-        name: order.assignedRider.name,
-        email: order.assignedRider.email,
-        phone: order.assignedRider.phone
-      } : null,
+      assignedRider: order.assignedRider
+        ? {
+            _id: order.assignedRider.id,
+            id: order.assignedRider.id,
+            name: order.assignedRider.name,
+            email: order.assignedRider.email,
+            phone: order.assignedRider.phone,
+          }
+        : null,
       serviceType: order.serviceType,
       paymentType: order.paymentType,
       productDescription: order.productDescription,
       weightKg: order.weightKg,
       serviceCharges: order.serviceCharges,
-      createdAt: order.createdAt
+      createdAt: order.createdAt,
     });
   } catch (error) {
     next(error);

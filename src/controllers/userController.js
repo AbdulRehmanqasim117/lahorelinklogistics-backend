@@ -1,14 +1,17 @@
-const User = require('../models/User');
-const ShipperProfile = require('../models/ShipperProfile');
-const RiderProfile = require('../models/RiderProfile');
 const bcrypt = require('bcryptjs');
-const Order = require('../models/Order');
-const CommissionConfig = require('../models/CommissionConfig');
+const prisma = require('../prismaClient');
 
 exports.getUsers = async (req, res, next) => {
   try {
-    const users = await User.find({}).sort({ createdAt: -1 });
-    res.json(users);
+    const users = await prisma.user.findMany({
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const safeUsers = users.map(({ passwordHash, ...u }) => ({
+      _id: u.id,
+      ...u,
+    }));
+    res.json(safeUsers);
   } catch (error) {
     next(error);
   }
@@ -16,7 +19,7 @@ exports.getUsers = async (req, res, next) => {
 
 exports.createUser = async (req, res, next) => {
   try {
-    const { 
+    const {
       name,
       email,
       phone,
@@ -36,7 +39,7 @@ exports.createUser = async (req, res, next) => {
       cnic,
     } = req.body;
 
-    const existingUser = await User.findOne({ email });
+    const existingUser = await prisma.user.findUnique({ where: { email } });
     if (existingUser) {
       return res.status(400).json({ message: 'User with this email already exists' });
     }
@@ -55,66 +58,73 @@ exports.createUser = async (req, res, next) => {
       return res.status(400).json({ message: 'Password must be at least 8 characters long' });
     }
 
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash(finalPassword, salt);
+    const passwordHash = await bcrypt.hash(finalPassword, 10);
 
-    const user = new User({
+    const data = {
       name,
       email,
       phone,
       passwordHash,
       role,
-      // Store shipper business fields directly in User for consistency
+      // Shipper business fields on User
       companyName: role === 'SHIPPER' ? companyName : undefined,
       cnicNumber: role === 'SHIPPER' ? cnicNumber : undefined,
       contactNumber: role === 'SHIPPER' ? (contactNumber || phone) : undefined,
       emergencyContact: role === 'SHIPPER' ? emergencyContact : undefined,
       pickupAddress: role === 'SHIPPER' ? (pickupAddress || address) : undefined,
       bankAccountDetails: role === 'SHIPPER' ? bankAccountDetails : undefined,
-
-      // Generic CNIC for roles where CEO provides it (e.g. MANAGER)
+      // Generic CNIC for MANAGER
       cnic: role === 'MANAGER' && cnic ? cnic : undefined,
-
       commissionStatus: role === 'SHIPPER' ? 'PENDING' : undefined,
-      isCommissionApproved: role === 'SHIPPER' ? false : undefined
-    });
+      isCommissionApproved: role === 'SHIPPER' ? false : undefined,
+    };
 
-    const savedUser = await user.save();
+    // Rider-specific core fields
+    if (role === 'RIDER') {
+      if (cnic) data.cnic = cnic;
+      // vehicleType/Number/Model live on User in Prisma schema
+    }
+
+    const createdUser = await prisma.user.create({ data });
 
     // Create related profiles
     if (role === 'SHIPPER') {
       if (!companyName) {
-        // Cleanup if validation fails (in a real app, use transactions)
-        await User.findByIdAndDelete(savedUser._id);
+        await prisma.user.delete({ where: { id: createdUser.id } });
         return res.status(400).json({ message: 'Company Name is required for Shippers' });
       }
-      await ShipperProfile.create({
-        user: savedUser._id,
-        companyName,
-        address
+      await prisma.shipperProfile.create({
+        data: {
+          userId: createdUser.id,
+          companyName,
+          address,
+        },
       });
     } else if (role === 'RIDER') {
       if (!vehicleInfo) {
-        await User.findByIdAndDelete(savedUser._id);
+        await prisma.user.delete({ where: { id: createdUser.id } });
         return res.status(400).json({ message: 'Vehicle Info is required for Riders' });
       }
-      await RiderProfile.create({
-        user: savedUser._id,
-        vehicleInfo
+      await prisma.riderProfile.create({
+        data: {
+          userId: createdUser.id,
+          vehicleInfo,
+        },
       });
     }
 
-    // For RIDER role, return password once for CEO to copy
-    const response = { 
-      message: 'User created successfully', 
-      user: savedUser 
+    const { passwordHash: _ph, ...safeUser } = createdUser;
+
+    const response = {
+      message: 'User created successfully',
+      user: safeUser,
     };
-    
+
     if (role === 'RIDER') {
       response.password = finalPassword; // Return password once (already hashed in DB)
       response.isTemporary = !password; // true if auto-generated
     }
-    
+
     res.status(201).json(response);
   } catch (error) {
     next(error);
@@ -130,17 +140,18 @@ exports.updateUserStatus = async (req, res, next) => {
       return res.status(400).json({ message: 'Invalid status' });
     }
 
-    const user = await User.findByIdAndUpdate(
-      id, 
-      { status }, 
-      { new: true }
-    );
-
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+    const userId = Number(id);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({ message: 'Invalid user id' });
     }
 
-    res.json(user);
+    const updated = await prisma.user.update({
+      where: { id: userId },
+      data: { status },
+    });
+
+    const { passwordHash, ...safeUser } = updated;
+    res.json(safeUser);
   } catch (error) {
     next(error);
   }
@@ -149,39 +160,40 @@ exports.updateUserStatus = async (req, res, next) => {
 exports.getRiders = async (req, res, next) => {
   try {
     const { active } = req.query;
-    const filter = { role: 'RIDER' };
-    if (active === 'true' || active === '1') {
-      filter.status = 'ACTIVE';
-    }
+    const where = {
+      role: 'RIDER',
+      ...(active === 'true' || active === '1' ? { status: 'ACTIVE' } : {}),
+    };
 
-    const riders = await User.find(filter)
-      .select('-passwordHash') // Never return password hash
-      .sort({ createdAt: -1 });
-    
-    // Enrich with rider profile data
+    const riders = await prisma.user.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+    });
+
     const ridersWithDetails = await Promise.all(
       riders.map(async (rider) => {
-        const profile = await RiderProfile.findOne({ user: rider._id });
-        const Order = require('../models/Order');
-        const assignedOrders = await Order.countDocuments({ assignedRider: rider._id });
-        const deliveredOrders = await Order.countDocuments({ 
-          assignedRider: rider._id, 
-          status: 'DELIVERED' 
-        });
-        
+        const [profile, assignedOrders, deliveredOrders] = await Promise.all([
+          prisma.riderProfile.findUnique({ where: { userId: rider.id } }),
+          prisma.order.count({ where: { assignedRiderId: rider.id } }),
+          prisma.order.count({ where: { assignedRiderId: rider.id, status: 'DELIVERED' } }),
+        ]);
+
+        const { passwordHash, ...safeRider } = rider;
+
         return {
-          ...rider.toObject(),
+          _id: safeRider.id,
+          ...safeRider,
           phone: rider.phone || 'N/A',
           vehicleInfo: profile?.vehicleInfo || 'N/A',
           codCollected: profile?.codCollected || 0,
           serviceCharges: profile?.serviceCharges || 0,
           serviceChargeStatus: profile?.serviceChargeStatus || 'unpaid',
           assignedOrders,
-          deliveredOrders
+          deliveredOrders,
         };
-      })
+      }),
     );
-    
+
     res.json(ridersWithDetails);
   } catch (error) {
     next(error);
@@ -190,11 +202,16 @@ exports.getRiders = async (req, res, next) => {
 
 exports.getManagers = async (req, res, next) => {
   try {
-    const managers = await User.find({ role: 'MANAGER' })
-      .select('-passwordHash')
-      .sort({ createdAt: -1 });
+    const managers = await prisma.user.findMany({
+      where: { role: 'MANAGER' },
+      orderBy: { createdAt: 'desc' },
+    });
 
-    res.json(managers);
+    const safeManagers = managers.map(({ passwordHash, ...u }) => ({
+      _id: u.id,
+      ...u,
+    }));
+    res.json(safeManagers);
   } catch (error) {
     next(error);
   }
@@ -214,30 +231,32 @@ exports.getRidersAssignedCounts = async (req, res, next) => {
       'FAILED',
     ];
 
-    const [riders, counts] = await Promise.all([
-      User.find({ role: 'RIDER' }).select('name').sort({ createdAt: -1 }).lean(),
-      Order.aggregate([
-        {
-          $match: {
-            assignedRider: { $ne: null },
-            status: { $in: activeStatuses },
-          },
-        },
-        {
-          $group: {
-            _id: '$assignedRider',
-            assignedCount: { $sum: 1 },
-          },
-        },
-      ]),
-    ]);
+    const riders = await prisma.user.findMany({
+      where: { role: 'RIDER' },
+      select: { id: true, name: true },
+      orderBy: { createdAt: 'desc' },
+    });
 
-    const countMap = new Map(counts.map((c) => [String(c._id), Number(c.assignedCount || 0)]));
+    const counts = await prisma.order.groupBy({
+      by: ['assignedRiderId'],
+      where: {
+        assignedRiderId: { not: null },
+        status: { in: activeStatuses },
+      },
+      _count: { _all: true },
+    });
+
+    const countMap = new Map(
+      counts.map((c) => [
+        c.assignedRiderId,
+        c._count ? c._count._all : 0,
+      ]),
+    );
 
     const result = riders.map((r) => ({
-      _id: r._id,
+      _id: r.id,
       name: r.name,
-      assignedCount: countMap.get(String(r._id)) || 0,
+      assignedCount: countMap.get(r.id) || 0,
     }));
 
     res.json(result);
@@ -249,13 +268,21 @@ exports.getRidersAssignedCounts = async (req, res, next) => {
 exports.getShippers = async (req, res, next) => {
   try {
     const { active } = req.query;
-    const filter = { role: 'SHIPPER' };
-    if (active === 'true' || active === '1') {
-      filter.status = 'ACTIVE';
-    }
+    const where = {
+      role: 'SHIPPER',
+      ...(active === 'true' || active === '1' ? { status: 'ACTIVE' } : {}),
+    };
 
-    const shippers = await User.find(filter).sort({ createdAt: -1 });
-    res.json(shippers);
+    const shippers = await prisma.user.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const safe = shippers.map(({ passwordHash, ...u }) => ({
+      _id: u.id,
+      ...u,
+    }));
+    res.json(safe);
   } catch (error) {
     next(error);
   }
@@ -263,41 +290,22 @@ exports.getShippers = async (req, res, next) => {
 
 exports.getMe = async (req, res, next) => {
   try {
-    const userId = req.user && (req.user.id || req.user._id);
+    const userId = req.user && req.user.id;
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized access. Token missing.' });
     }
 
-    const user = await User.findById(userId)
-      .select('-passwordHash')
-      .lean();
+    const user = await prisma.user.findUnique({ where: { id: userId } });
 
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    // Derive portalActive + weightBracketsCount for SHIPPER accounts based on
-    // commission configuration so the frontend can gate portal access.
-    if (user.role === 'SHIPPER') {
-      try {
-        const cfg = await CommissionConfig.findOne({ shipper: user._id })
-          .select('weightBrackets')
-          .lean();
+    const { passwordHash, ...safeUser } = user;
+    const responseUser = { _id: safeUser.id, ...safeUser };
 
-        const count = Array.isArray(cfg?.weightBrackets)
-          ? cfg.weightBrackets.length
-          : 0;
-
-        user.weightBracketsCount = count;
-        user.portalActive = count > 0;
-      } catch (err) {
-        console.error('Error deriving shipper portal flags:', err);
-        user.weightBracketsCount = null;
-        user.portalActive = false;
-      }
-    }
-
-    res.json({ user });
+    // TODO: if needed later, compute portalActive/weightBracketsCount from Prisma-based finance config
+    res.json({ user: responseUser });
   } catch (error) {
     next(error);
   }
@@ -314,7 +322,12 @@ exports.setShipperCommissionApproval = async (req, res, next) => {
       isCommissionApproved,
     } = req.body;
 
-    const shipper = await User.findById(id);
+    const shipperId = Number(id);
+    if (!Number.isInteger(shipperId) || shipperId <= 0) {
+      return res.status(400).json({ message: 'Invalid user id' });
+    }
+
+    const shipper = await prisma.user.findUnique({ where: { id: shipperId } });
     if (!shipper) {
       return res.status(404).json({ message: 'User not found' });
     }
@@ -370,7 +383,9 @@ exports.setShipperCommissionApproval = async (req, res, next) => {
 
     const hasValue =
       (shipper.commissionRate !== null && shipper.commissionRate !== undefined) ||
-      (shipper.commissionType && shipper.commissionValue !== null && shipper.commissionValue !== undefined);
+      (shipper.commissionType &&
+        shipper.commissionValue !== null &&
+        shipper.commissionValue !== undefined);
 
     const approved =
       shipper.commissionStatus === 'APPROVED' || shipper.isCommissionApproved === true;
@@ -380,7 +395,7 @@ exports.setShipperCommissionApproval = async (req, res, next) => {
     }
 
     if (approved) {
-      shipper.approvedBy = req.user.id || req.user._id;
+      shipper.approvedBy = req.user.id;
       shipper.approvedAt = new Date();
       shipper.isCommissionApproved = true;
       shipper.commissionStatus = 'APPROVED';
@@ -391,8 +406,21 @@ exports.setShipperCommissionApproval = async (req, res, next) => {
       shipper.commissionStatus = 'PENDING';
     }
 
-    const updated = await shipper.save();
-    res.json({ user: updated.toJSON() });
+    const updated = await prisma.user.update({
+      where: { id: shipperId },
+      data: {
+        commissionRate: shipper.commissionRate,
+        commissionType: shipper.commissionType,
+        commissionValue: shipper.commissionValue,
+        commissionStatus: shipper.commissionStatus,
+        isCommissionApproved: shipper.isCommissionApproved,
+        approvedBy: shipper.approvedBy,
+        approvedAt: shipper.approvedAt,
+      },
+    });
+
+    const { passwordHash, ...safeUpdated } = updated;
+    res.json({ user: { _id: safeUpdated.id, ...safeUpdated } });
   } catch (error) {
     next(error);
   }
@@ -425,7 +453,12 @@ exports.resetPassword = async (req, res, next) => {
     const { id } = req.params;
     let { newPassword } = req.body;
 
-    const user = await User.findById(id);
+    const userId = Number(id);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({ message: 'Invalid user id' });
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
@@ -447,12 +480,13 @@ exports.resetPassword = async (req, res, next) => {
     }
 
     // Hash the new password
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash(newPassword, salt);
+    const passwordHash = await bcrypt.hash(newPassword, 10);
 
     // Update user password
-    user.passwordHash = passwordHash;
-    await user.save();
+    await prisma.user.update({
+      where: { id: userId },
+      data: { passwordHash },
+    });
 
     // Return success message with temporary password (one-time display)
     res.json({ 

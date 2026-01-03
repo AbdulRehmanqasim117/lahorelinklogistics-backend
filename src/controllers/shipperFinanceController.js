@@ -5,6 +5,7 @@ const CommissionConfig = require('../models/CommissionConfig');
 const ShipperProfile = require('../models/ShipperProfile');
 const ShipperLedger = require('../models/ShipperLedger');
 const { calculateServiceCharges } = require('../utils/serviceChargeCalculator');
+const prisma = require('../prismaClient');
 
 const formatPolicy = (cfg) => {
   if (!cfg) return null;
@@ -18,7 +19,8 @@ const formatPolicy = (cfg) => {
       .map((b) => ({
         minKg: b.minKg,
         maxKg: b.maxKg === undefined ? null : b.maxKg,
-        charge: b.charge,
+        // Prisma uses chargePkr; legacy Mongoose used charge
+        charge: b.chargePkr !== undefined ? b.chargePkr : b.charge,
       })),
   };
 };
@@ -108,39 +110,69 @@ const ensureLedgerBackfilled = async (shipperId) => {
 exports.getMyFinanceSummary = async (req, res, next) => {
   try {
     const shipperIdRaw = req.user.id || req.user._id;
-    const shipperId = new mongoose.Types.ObjectId(String(shipperIdRaw));
+    const shipperId = Number(shipperIdRaw);
 
-    await ensureLedgerBackfilled(shipperId);
+    if (!Number.isInteger(shipperId) || shipperId <= 0) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
 
-    const [user, profile, cfg, balanceAgg] = await Promise.all([
-      User.findById(shipperId).lean(),
-      ShipperProfile.findOne({ user: shipperId }).lean(),
-      CommissionConfig.findOne({ shipper: shipperId }).lean(),
-      ShipperLedger.aggregate([
-        { $match: { shipperId } },
-        { $group: { _id: null, balance: { $sum: '$amount' } } },
-      ]),
+    const [user, profile, cfg, orders] = await Promise.all([
+      prisma.user.findUnique({ where: { id: shipperId } }),
+      prisma.shipperProfile.findUnique({ where: { userId: shipperId } }),
+      prisma.commissionConfig.findUnique({
+        where: { shipperId },
+        include: { weightBrackets: true },
+      }),
+      prisma.order.findMany({
+        where: {
+          shipperId,
+          isDeleted: false,
+          status: { in: ['DELIVERED', 'RETURNED'] },
+        },
+        select: {
+          status: true,
+          paymentType: true,
+          amountCollected: true,
+          codAmount: true,
+          serviceCharges: true,
+        },
+      }),
     ]);
 
-    const balance = Number(balanceAgg?.[0]?.balance || 0);
+    let balance = 0;
+    for (const o of orders) {
+      const isDelivered = o.status === 'DELIVERED';
+      const cod =
+        isDelivered && o.paymentType === 'COD'
+          ? Number(o.amountCollected ?? o.codAmount ?? 0)
+          : 0;
+      const svc = Number(o.serviceCharges || 0);
+      const receivable = cod - svc;
+      balance += receivable;
+    }
+
+    const shipper = user
+      ? {
+          _id: user.id,
+          id: user.id,
+          name: user.name,
+          companyName: user.companyName || profile?.companyName || null,
+          phone: user.phone || user.contactNumber || null,
+          email: user.email,
+          address: user.pickupAddress || profile?.address || null,
+          cnic: user.cnic || user.cnicNumber || null,
+          iban: user.iban || null,
+          bankName: user.bankName || null,
+          accountNumber: user.accountNumber || null,
+          accountHolderName: user.accountHolderName || null,
+          createdAt: user.createdAt,
+        }
+      : null;
 
     res.json({
-      shipper: {
-        _id: user?._id,
-        name: user?.name,
-        companyName: user?.companyName || profile?.companyName,
-        phone: user?.phone || user?.contactNumber,
-        email: user?.email,
-        address: user?.pickupAddress || profile?.address,
-        cnic: user?.cnic || user?.cnicNumber,
-        iban: user?.iban,
-        bankName: user?.bankName,
-        accountNumber: user?.accountNumber,
-        accountHolderName: user?.accountHolderName,
-        createdAt: user?.createdAt,
-      },
+      shipper,
       serviceChargesPolicy: formatPolicy(cfg),
-      balance,
+      balance: Number(balance || 0),
     });
   } catch (error) {
     next(error);
@@ -150,9 +182,12 @@ exports.getMyFinanceSummary = async (req, res, next) => {
 exports.getMyFinanceLedger = async (req, res, next) => {
   try {
     const shipperIdRaw = req.user.id || req.user._id;
-    const shipperId = new mongoose.Types.ObjectId(String(shipperIdRaw));
+    const shipperId = Number(shipperIdRaw);
 
-    await ensureLedgerBackfilled(shipperId);
+    if (!Number.isInteger(shipperId) || shipperId <= 0) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
     const {
       from,
       to,
@@ -163,110 +198,94 @@ exports.getMyFinanceLedger = async (req, res, next) => {
       limit = 20,
     } = req.query;
 
-    const match = {
+    const where = {
       shipperId,
+      isDeleted: false,
     };
 
     if (from || to) {
-      match.date = {};
-      if (from) match.date.$gte = new Date(from);
+      const createdAt = {};
+      if (from) {
+        const d = new Date(from);
+        if (!Number.isNaN(d.getTime())) createdAt.gte = d;
+      }
       if (to) {
         const t = new Date(to);
         t.setHours(23, 59, 59, 999);
-        match.date.$lte = t;
+        if (!Number.isNaN(t.getTime())) createdAt.lte = t;
       }
-    }
-
-    if (status && ['PAID', 'UNPAID'].includes(String(status).toUpperCase())) {
-      match.status = String(status).toUpperCase();
+      if (Object.keys(createdAt).length) {
+        where.createdAt = createdAt;
+      }
     }
 
     if (search && String(search).trim()) {
-      match.bookingId = { $regex: String(search).trim(), $options: 'i' };
+      const term = String(search).trim();
+      where.bookingId = { contains: term, mode: 'insensitive' };
     }
+
+    // status filter currently not wired to a dedicated ledger table; keep all
+    // rows regardless of PAID/UNPAID toggle for now.
 
     const pageNum = Math.max(1, Number(page) || 1);
-    const exportAll = String(limit).toLowerCase() === 'all' || String(format).toLowerCase() === 'csv';
-    const limitNum = exportAll ? 5000 : Math.min(200, Math.max(1, Number(limit) || 20));
+    const isCsv = String(format).toLowerCase() === 'csv';
+    const exportAll =
+      String(limit).toLowerCase() === 'all' || isCsv;
+    const limitNum = exportAll
+      ? 5000
+      : Math.min(200, Math.max(1, Number(limit) || 20));
 
-    const [total, totalsAgg] = await Promise.all([
-      ShipperLedger.countDocuments(match),
-      ShipperLedger.aggregate([
-        { $match: match },
-        {
-          $group: {
-            _id: null,
-            totalCod: {
-              $sum: {
-                $cond: [{ $eq: ['$type', 'ORDER'] }, { $ifNull: ['$codAmount', 0] }, 0],
-              },
-            },
-            totalServiceCharges: {
-              $sum: {
-                $cond: [{ $eq: ['$type', 'ORDER'] }, { $ifNull: ['$serviceCharges', 0] }, 0],
-              },
-            },
-            totalReceivable: {
-              $sum: {
-                $cond: [{ $eq: ['$type', 'ORDER'] }, { $ifNull: ['$receivable', 0] }, 0],
-              },
-            },
-            totalAmount: { $sum: '$amount' },
-          },
-        },
-      ]),
+    const [total, orders] = await Promise.all([
+      prisma.order.count({ where }),
+      prisma.order.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: exportAll ? 0 : (pageNum - 1) * limitNum,
+        take: exportAll ? limitNum : limitNum,
+      }),
     ]);
 
-    const rowsQuery = ShipperLedger.find(match).sort({ date: -1, createdAt: -1 });
-    const rows = exportAll
-      ? await rowsQuery.limit(Math.min(total || 0, limitNum)).lean()
-      : await rowsQuery
-          .skip((pageNum - 1) * limitNum)
-          .limit(limitNum)
-          .lean();
+    const rows = orders.map((o) => {
+      const isDelivered = o.status === 'DELIVERED';
+      const codForDelivered =
+        isDelivered && o.paymentType === 'COD'
+          ? Number(o.amountCollected ?? o.codAmount ?? 0)
+          : 0;
+      const codAmount =
+        isDelivered && o.paymentType === 'COD'
+          ? codForDelivered
+          : Number(o.codAmount ?? 0);
 
-    const orderIds = Array.from(
-      new Set(
-        rows
-          .filter((r) => r && r.type === 'ORDER' && r.orderId)
-          .map((r) => String(r.orderId)),
-      ),
+      const serviceCharges = Number(o.serviceCharges || 0);
+      const receivable = codAmount - serviceCharges;
+
+      return {
+        _id: o.id,
+        id: o.id,
+        date: o.deliveredAt || o.updatedAt || o.createdAt,
+        particular: o.consigneeName || 'Order',
+        bookingId: o.bookingId,
+        codAmount,
+        serviceCharges,
+        receivable,
+        amount: receivable,
+        status: 'UNPAID',
+        weightKg: o.weightKg,
+      };
+    });
+
+    const totals = rows.reduce(
+      (acc, r) => {
+        acc.totalCod += Number(r.codAmount || 0);
+        acc.totalServiceCharges += Number(r.serviceCharges || 0);
+        acc.totalReceivable += Number(r.receivable || 0);
+        acc.totalAmount += Number(r.amount || 0);
+        return acc;
+      },
+      { totalCod: 0, totalServiceCharges: 0, totalReceivable: 0, totalAmount: 0 },
     );
-    if (orderIds.length > 0) {
-      const orderDocs = await Order.find({ _id: { $in: orderIds } })
-        .select('_id weightKg weightOriginalKg bookingId')
-        .lean();
-      const orderMap = new Map(
-        orderDocs.map((o) => [String(o._id), o]),
-      );
-      for (const row of rows) {
-        if (!row || row.type !== 'ORDER' || !row.orderId) continue;
-        if (row.weightKg && Number(row.weightKg) > 0) continue;
-        const ord = orderMap.get(String(row.orderId));
-        if (!ord) continue;
-        const raw =
-          typeof ord.weightKg === 'number' && ord.weightKg > 0
-            ? ord.weightKg
-            : ord.weightOriginalKg;
-        if (raw && Number(raw) > 0) {
-          row.weightKg = Number(raw);
-        }
-      }
-    }
 
-    if (process.env.NODE_ENV !== 'production') {
-      try {
-        const sample = rows.slice(0, 5).map((r) => ({
-          bookingId: r.bookingId,
-          type: r.type,
-          weightKg: r.weightKg,
-        }));
-        console.log('[getMyFinanceLedger] sample weights:', sample);
-      } catch (e) {
-      }
-    }
-
-    if (String(format).toLowerCase() === 'csv') {
+    if (isCsv) {
       const escape = (v) => {
         if (v === null || v === undefined) return '';
         const s = String(v);
@@ -301,21 +320,26 @@ exports.getMyFinanceLedger = async (req, res, next) => {
       }
 
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', 'attachment; filename="shipper-ledger.csv"');
+      res.setHeader(
+        'Content-Disposition',
+        'attachment; filename="shipper-ledger.csv"',
+      );
       return res.send(lines.join('\n'));
     }
+
+    const totalPages = exportAll ? 1 : Math.ceil(total / limitNum) || 0;
 
     res.json({
       rows,
       page: pageNum,
       limit: limitNum,
       total,
-      totalPages: Math.ceil(total / limitNum),
+      totalPages,
       totals: {
-        totalCod: Number(totalsAgg?.[0]?.totalCod || 0),
-        totalServiceCharges: Number(totalsAgg?.[0]?.totalServiceCharges || 0),
-        totalReceivable: Number(totalsAgg?.[0]?.totalReceivable || 0),
-        totalAmount: Number(totalsAgg?.[0]?.totalAmount || 0),
+        totalCod: Number(totals.totalCod || 0),
+        totalServiceCharges: Number(totals.totalServiceCharges || 0),
+        totalReceivable: Number(totals.totalReceivable || 0),
+        totalAmount: Number(totals.totalAmount || 0),
       },
     });
   } catch (error) {

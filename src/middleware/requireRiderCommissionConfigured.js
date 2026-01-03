@@ -1,4 +1,4 @@
-const RiderCommissionConfig = require('../models/RiderCommissionConfig');
+const prisma = require('../prismaClient');
 
 module.exports = async function requireRiderCommissionConfigured(req, res, next) {
   try {
@@ -7,14 +7,15 @@ module.exports = async function requireRiderCommissionConfigured(req, res, next)
       return next();
     }
 
-    const riderId = req.user.id || req.user._id;
-    if (!riderId) {
+    const riderIdNum = Number(req.user.id);
+    if (!riderIdNum || !Number.isInteger(riderIdNum)) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const cfg = await RiderCommissionConfig.findOne({ rider: riderId })
-      .select('type value rules')
-      .lean();
+    const cfg = await prisma.riderCommissionConfig.findUnique({
+      where: { riderId: riderIdNum },
+      include: { rules: true },
+    });
 
     const hasRules = cfg && Array.isArray(cfg.rules) && cfg.rules.length > 0;
     const hasBaseCommission =

@@ -2,16 +2,16 @@ const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const FinancialTransaction = require('../models/FinancialTransaction');
 const RiderCommissionConfig = require('../models/RiderCommissionConfig');
+const prisma = require('../prismaClient');
 
-// GET /api/rider/finance
+// GET /api/riders/finance/me
 // Rider self-finance view (only their own assigned orders)
 exports.getMyFinance = async (req, res, next) => {
   try {
-    const riderIdRaw = req.user.id || req.user._id;
-    if (!riderIdRaw) {
+    const riderId = Number(req.user.id);
+    if (!riderId || !Number.isInteger(riderId)) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
-    const riderId = new mongoose.Types.ObjectId(String(riderIdRaw));
 
     const {
       from,
@@ -22,318 +22,146 @@ exports.getMyFinance = async (req, res, next) => {
       limit = 20,
     } = req.query;
 
-    const normalizedStatus = String(status || 'all').toLowerCase();
     const allowedFinalStatuses = ['DELIVERED', 'RETURNED', 'FAILED'];
+    const normalizedStatus = String(status || 'all').toLowerCase();
 
-    let statusMatch;
+    let statusFilter;
     if (normalizedStatus === 'delivered') {
-      statusMatch = 'DELIVERED';
+      statusFilter = 'DELIVERED';
     } else if (normalizedStatus === 'returned') {
-      statusMatch = 'RETURNED';
+      statusFilter = 'RETURNED';
     } else if (normalizedStatus === 'failed') {
-      statusMatch = 'FAILED';
+      statusFilter = 'FAILED';
     } else {
-      statusMatch = { $in: allowedFinalStatuses };
+      statusFilter = { in: allowedFinalStatuses };
     }
 
-    const baseMatch = {
-      assignedRider: riderId,
-      status: statusMatch,
-      isDeleted: { $ne: true },
-    };
-
-    // Date range filter (based on createdAt for simplicity/consistency with rider dashboard)
-    const createdAtRange = {};
+    const createdAtFilter = {};
     if (from) {
       const d = new Date(from);
       d.setHours(0, 0, 0, 0);
-      if (!Number.isNaN(d.getTime())) createdAtRange.$gte = d;
+      if (!Number.isNaN(d.getTime())) createdAtFilter.gte = d;
     }
     if (to) {
       const d = new Date(to);
       d.setHours(23, 59, 59, 999);
-      if (!Number.isNaN(d.getTime())) createdAtRange.$lte = d;
+      if (!Number.isNaN(d.getTime())) createdAtFilter.lte = d;
     }
-    if (Object.keys(createdAtRange).length) {
-      baseMatch.createdAt = createdAtRange;
-    }
+
+    const orderWhere = {
+      status: statusFilter,
+      isDeleted: false,
+      assignedRiderId: riderId,
+      ...(Object.keys(createdAtFilter).length ? { createdAt: createdAtFilter } : {}),
+    };
 
     const pageNum = Math.max(1, Number(page) || 1);
     const limitNum = Math.min(100, Math.max(1, Number(limit) || 20));
-    const sortDir = sortOrder === 'asc' ? 1 : -1;
+    const orderDir = sortOrder === 'asc' ? 'asc' : 'desc';
 
-    // Summary aggregation over ALL filtered orders (no pagination)
-    const summaryMatch = { ...baseMatch };
-    const summaryAgg = await Order.aggregate([
-      { $match: summaryMatch },
-      {
-        $lookup: {
-          from: 'financialtransactions',
-          localField: '_id',
-          foreignField: 'order',
-          as: 'tx',
+    // Summary over all matching transactions/orders
+    const [allTxs, unpaidBalanceRow] = await Promise.all([
+      prisma.financialTransaction.findMany({
+        where: {
+          riderId,
+          order: orderWhere,
         },
-      },
-      {
-        $unwind: { path: '$tx', preserveNullAndEmptyArrays: true },
-      },
-      {
-        $addFields: {
-          txSettlementStatus: { $toUpper: { $ifNull: ['$tx.settlementStatus', 'UNPAID'] } },
-          effectiveSettlementStatus: {
-            // Prefer order-level riderSettlementStatus when present; otherwise fall
-            // back to the transaction settlement status (for legacy data).
-            $let: {
-              vars: {
-                orderStatus: {
-                  $toUpper: { $ifNull: ['$riderSettlementStatus', ''] },
-                },
-              },
-              in: {
-                $cond: [
-                  { $in: ['$$orderStatus', ['PAID', 'UNPAID']] },
-                  '$$orderStatus',
-                  '$txSettlementStatus',
-                ],
-              },
-            },
-          },
-          effectiveRiderEarning: {
-            // Prefer order.riderEarning when non-zero; otherwise fall back to
-            // transaction.riderCommission.
-            $cond: [
-              { $gt: [{ $ifNull: ['$riderEarning', 0] }, 0] },
-              { $ifNull: ['$riderEarning', 0] },
-              { $ifNull: ['$tx.riderCommission', 0] },
-            ],
-          },
+        include: {
+          order: true,
         },
-      },
-      {
-        $group: {
-          _id: null,
-          deliveredCount: {
-            $sum: { $cond: [{ $eq: ['$status', 'DELIVERED'] }, 1, 0] },
-          },
-          returnedCount: {
-            $sum: { $cond: [{ $eq: ['$status', 'RETURNED'] }, 1, 0] },
-          },
-          paidCount: {
-            $sum: {
-              $cond: [
-                { $in: ['$effectiveSettlementStatus', ['PAID', 'SETTLED']] },
-                1,
-                0,
-              ],
-            },
-          },
-          unpaidCount: {
-            $sum: {
-              $cond: [
-                { $in: ['$effectiveSettlementStatus', ['UNPAID', 'PENDING']] },
-                1,
-                0,
-              ],
-            },
-          },
-          codCollected: {
-            $sum: {
-              $cond: [
-                {
-                  $and: [
-                    { $eq: ['$status', 'DELIVERED'] },
-                    { $eq: ['$paymentType', 'COD'] },
-                  ],
-                },
-                { $ifNull: ['$amountCollected', '$codAmount'] },
-                0,
-              ],
-            },
-          },
-          serviceChargesTotal: {
-            $sum: { $ifNull: ['$serviceCharges', 0] },
-          },
-          riderEarnings: {
-            $sum: { $ifNull: ['$effectiveRiderEarning', 0] },
-          },
-          riderEarningsPaid: {
-            $sum: {
-              $cond: [
-                { $in: ['$effectiveSettlementStatus', ['PAID', 'SETTLED']] },
-                { $ifNull: ['$effectiveRiderEarning', 0] },
-                0,
-              ],
-            },
-          },
-          riderEarningsUnpaid: {
-            $sum: {
-              $cond: [
-                { $in: ['$effectiveSettlementStatus', ['UNPAID', 'PENDING']] },
-                { $ifNull: ['$effectiveRiderEarning', 0] },
-                0,
-              ],
-            },
-          },
+      }),
+      prisma.financialTransaction.aggregate({
+        _sum: { riderCommission: true },
+        where: {
+          riderId,
+          settlementStatus: { in: ['UNPAID', 'PENDING'] },
         },
-      },
+      }),
     ]);
 
-    const summaryRow = summaryAgg[0] || {};
-    const summary = summaryRow;
+    const summary = {
+      deliveredCount: 0,
+      returnedCount: 0,
+      failedCount: 0,
+      codCollected: 0,
+      serviceChargesTotal: 0,
+      riderEarnings: 0,
+      riderEarningsPaid: 0,
+      riderEarningsUnpaid: 0,
+      unpaidBalance: 0,
+    };
 
-    // Unpaid balance = sum of riderCommission for PENDING transactions (all time)
-    const unpaidAgg = await FinancialTransaction.aggregate([
-      {
-        $match: {
-          rider: riderId,
-          settlementStatus: { $in: ['UNPAID', 'PENDING'] },
-        },
-      },
-      {
-        $group: {
-          _id: null,
-          unpaidBalance: { $sum: { $ifNull: ['$riderCommission', 0] } },
-        },
-      },
-    ]);
-    const unpaidBalance = Number(unpaidAgg?.[0]?.unpaidBalance || 0);
+    for (const tx of allTxs) {
+      const o = tx.order;
+      if (!o) continue;
 
-    // Load rider commission configuration once for this rider to allow
-    // fallback calculation for legacy transactions where riderCommission was
-    // stored as 0 before logic was fixed.
-    const riderCommissionConfig = await RiderCommissionConfig.findOne({
-      rider: riderId,
-    }).lean();
+      if (o.status === 'DELIVERED') summary.deliveredCount += 1;
+      else if (o.status === 'RETURNED') summary.returnedCount += 1;
+      else if (o.status === 'FAILED') summary.failedCount += 1;
 
-    // Paginated items
-    const orderMatch = { ...baseMatch };
-
-    const total = await Order.countDocuments(orderMatch);
-    const orders = await Order.find(orderMatch)
-      .populate('shipper', 'name companyName')
-      .sort({ createdAt: sortDir })
-      .skip((pageNum - 1) * limitNum)
-      .limit(limitNum)
-      .lean();
-
-    const orderIds = orders.map((o) => o._id);
-    const txs = orderIds.length
-      ? await FinancialTransaction.find({
-          order: { $in: orderIds },
-          rider: riderId,
-        })
-          .lean()
-      : [];
-
-    const txByOrder = new Map(txs.map((tx) => [String(tx.order), tx]));
-
-    const items = orders.map((o) => {
-      const tx = txByOrder.get(String(o._id));
-      let riderEarning = Number(
-        o.riderEarning !== undefined && o.riderEarning !== null
-          ? o.riderEarning
-          : tx?.riderCommission || 0,
-      );
-
-      // Fallback: if there is no transaction/order earning or earning is 0,
-      // try to compute rider earning from RiderCommissionConfig so that legacy
-      // RETURNED/FAILED orders show the correct configured commission.
-      if (((!tx && !o.riderEarning) || riderEarning === 0) && riderCommissionConfig) {
-        const normalizedStatus = String(o.status || '').trim().toUpperCase();
-        const isDeliveredOrder = normalizedStatus === 'DELIVERED';
-
-        const collectedCodForOrder = isDeliveredOrder
-          ? (o.amountCollected || o.codAmount || 0)
-          : 0;
-        const originalCodForOrder = Number(o.codAmount || 0);
-
-        const rules = Array.isArray(riderCommissionConfig.rules)
-          ? riderCommissionConfig.rules
-          : [];
-        const normalizedRules = rules.map((r) => ({
-          ...r,
-          _normalizedStatus: String(r.status || '').trim().toUpperCase(),
-        }));
-
-        const rule = normalizedRules.find(
-          (r) => r._normalizedStatus === normalizedStatus,
-        );
-
-        const applyRule = (type, value, codBase) => {
-          const numericValue = Number(value || 0);
-          if (type === 'PERCENTAGE') {
-            return (Number(codBase || 0) * numericValue) / 100;
-          }
-          return numericValue;
-        };
-
-        if (rule && rule.value !== undefined) {
-          const codBase = isDeliveredOrder
-            ? (o.amountCollected || o.codAmount || 0)
-            : originalCodForOrder;
-          const typeToUse = rule.type || riderCommissionConfig.type || 'FLAT';
-          riderEarning = applyRule(typeToUse, rule.value, codBase);
-        } else if (
-          riderCommissionConfig.type &&
-          riderCommissionConfig.value !== undefined
-        ) {
-          const codBase = isDeliveredOrder
-            ? (o.amountCollected || o.codAmount || 0)
-            : originalCodForOrder;
-          riderEarning = applyRule(
-            riderCommissionConfig.type,
-            riderCommissionConfig.value,
-            codBase,
-          );
-        }
-
-        // Clamp only for delivered orders so commission does not exceed COD.
-        if (isDeliveredOrder) {
-          const codForClamp = Number(o.amountCollected || o.codAmount || 0);
-          if (codForClamp > 0 && riderEarning > codForClamp) {
-            riderEarning = codForClamp;
-          }
-        }
-
-        if (!Number.isFinite(riderEarning) || riderEarning < 0) {
-          riderEarning = 0;
-        }
+      if (o.status === 'DELIVERED' && o.paymentType === 'COD') {
+        const codAmt = o.amountCollected != null ? o.amountCollected : o.codAmount || 0;
+        summary.codCollected += codAmt;
       }
 
-      const normalizedOrderSettlement = String(o.riderSettlementStatus || '').toUpperCase();
-      let settlementStatus;
-      if (['PAID', 'UNPAID'].includes(normalizedOrderSettlement)) {
-        settlementStatus = normalizedOrderSettlement === 'PAID' ? 'PAID' : 'UNPAID';
+      summary.serviceChargesTotal += o.serviceCharges || 0;
+      summary.riderEarnings += tx.riderCommission || 0;
+
+      const st = String(tx.settlementStatus || '').toUpperCase();
+      if (['PAID', 'SETTLED'].includes(st)) {
+        summary.riderEarningsPaid += tx.riderCommission || 0;
       } else {
-        const normalizedTxStatus = String(tx?.settlementStatus || '').toUpperCase();
-        settlementStatus = ['PAID', 'SETTLED'].includes(normalizedTxStatus)
-          ? 'PAID'
-          : 'UNPAID';
+        summary.riderEarningsUnpaid += tx.riderCommission || 0;
       }
+    }
 
-      const date = o.deliveredAt || o.updatedAt || o.createdAt;
+    summary.unpaidBalance = Number(
+      unpaidBalanceRow?._sum?.riderCommission || summary.riderEarningsUnpaid,
+    );
+
+    // Paginated list of transactions with joined orders
+    const [total, txPage] = await Promise.all([
+      prisma.financialTransaction.count({
+        where: { riderId, order: orderWhere },
+      }),
+      prisma.financialTransaction.findMany({
+        where: { riderId, order: orderWhere },
+        include: {
+          order: {
+            include: {
+              shipper: { select: { companyName: true, name: true } },
+            },
+          },
+        },
+        orderBy: { createdAt: orderDir },
+        skip: (pageNum - 1) * limitNum,
+        take: limitNum,
+      }),
+    ]);
+
+    const items = txPage.map((tx) => {
+      const o = tx.order;
       const codAmount =
-        o.status === 'DELIVERED'
+        o?.status === 'DELIVERED'
           ? Number(o.amountCollected ?? o.codAmount ?? 0)
-          : Number(o.codAmount ?? 0);
+          : Number(o?.codAmount ?? 0);
+      const settlementStatus = String(tx.settlementStatus || '').toUpperCase();
 
       return {
-        id: o._id,
-        orderId: o.bookingId,
-        date,
-        shipperName: o.shipper?.companyName || o.shipper?.name || '',
-        destination: o.destinationCity,
+        id: o?.id || tx.id,
+        orderId: o?.bookingId || '',
+        date: o?.deliveredAt || o?.updatedAt || o?.createdAt || tx.createdAt,
+        shipperName: o?.shipper?.companyName || o?.shipper?.name || '',
+        destination: o?.destinationCity || '',
         codAmount,
-        serviceCharges: Number(o.serviceCharges || 0),
-        riderEarning,
-        status: o.status,
+        serviceCharges: Number(o?.serviceCharges || 0),
+        riderEarning: Number(tx.riderCommission || 0),
+        status: o?.status || null,
         settlementStatus,
-        riderSettlementAt: o.riderSettlementAt,
-        riderSettlementBy: o.riderSettlementBy,
+        riderSettlementAt: tx.paidAt || null,
+        riderSettlementBy: tx.paidById || null,
       };
     });
-
-    summary.unpaidBalance = unpaidBalance;
 
     res.json({
       summary: {
@@ -362,12 +190,10 @@ exports.getMyFinance = async (req, res, next) => {
 // Admin (CEO/MANAGER) view of a specific rider's settlements with filters.
 exports.getRiderSettlementsAdmin = async (req, res, next) => {
   try {
-    const rawId = req.params.id;
-    if (!rawId || !mongoose.isValidObjectId(String(rawId))) {
+    const riderId = Number(req.params.id);
+    if (!Number.isInteger(riderId) || riderId <= 0) {
       return res.status(400).json({ message: 'Invalid rider id' });
     }
-
-    const riderId = new mongoose.Types.ObjectId(String(rawId));
 
     const {
       from,
@@ -381,126 +207,75 @@ exports.getRiderSettlementsAdmin = async (req, res, next) => {
       search,
     } = req.query;
 
-    const normalizedStatus = String(status || 'all').toLowerCase();
     const allowedFinalStatuses = ['DELIVERED', 'RETURNED', 'FAILED'];
+    const normalizedStatus = String(status || 'all').toLowerCase();
 
-    let statusMatch;
+    let statusFilter;
     if (normalizedStatus === 'delivered') {
-      statusMatch = 'DELIVERED';
+      statusFilter = 'DELIVERED';
     } else if (normalizedStatus === 'returned') {
-      statusMatch = 'RETURNED';
+      statusFilter = 'RETURNED';
     } else if (normalizedStatus === 'failed') {
-      statusMatch = 'FAILED';
+      statusFilter = 'FAILED';
     } else {
-      statusMatch = { $in: allowedFinalStatuses };
+      statusFilter = { in: allowedFinalStatuses };
     }
 
-    const baseMatch = {
-      assignedRider: riderId,
-      status: statusMatch,
-      isDeleted: { $ne: true },
+    const where = {
+      assignedRiderId: riderId,
+      isDeleted: false,
+      status: statusFilter,
     };
 
-    // Date range using the same "effective" order date as the Company
-    // Ledger: for delivered orders use deliveredAt (falling back to
-    // updatedAt), and for all other final statuses use updatedAt (falling
-    // back to createdAt). This keeps Rider Settlements and Company
-    // Finance in sync when using quick ranges like Today/7/30 days.
     if (from || to) {
-      let rangeStart = null;
-      let rangeEnd = null;
-
+      const createdAt = {};
       if (from) {
         const d = new Date(from);
         d.setHours(0, 0, 0, 0);
-        if (!Number.isNaN(d.getTime())) rangeStart = d;
+        if (!Number.isNaN(d.getTime())) createdAt.gte = d;
       }
       if (to) {
         const d = new Date(to);
         d.setHours(23, 59, 59, 999);
-        if (!Number.isNaN(d.getTime())) rangeEnd = d;
+        if (!Number.isNaN(d.getTime())) createdAt.lte = d;
       }
-
-      if (rangeStart || rangeEnd) {
-        const effectiveDateExpr = {
-          $cond: [
-            { $eq: ['$status', 'DELIVERED'] },
-            { $ifNull: ['$deliveredAt', '$updatedAt'] },
-            { $ifNull: ['$updatedAt', '$createdAt'] },
-          ],
-        };
-
-        const exprConds = [];
-        if (rangeStart) {
-          exprConds.push({ $gte: [effectiveDateExpr, rangeStart] });
-        }
-        if (rangeEnd) {
-          exprConds.push({ $lte: [effectiveDateExpr, rangeEnd] });
-        }
-
-        if (exprConds.length === 1) {
-          baseMatch.$expr = exprConds[0];
-        } else if (exprConds.length > 1) {
-          baseMatch.$expr = { $and: exprConds };
-        }
+      if (Object.keys(createdAt).length) {
+        where.createdAt = createdAt;
       }
     }
 
-    // Optional shipper filter
-    if (shipperId && mongoose.isValidObjectId(String(shipperId))) {
-      baseMatch.shipper = new mongoose.Types.ObjectId(String(shipperId));
+    if (shipperId) {
+      const sid = Number(shipperId);
+      if (Number.isInteger(sid) && sid > 0) {
+        where.shipperId = sid;
+      }
     }
 
-    // Settlement filter (order-level first, then implicit unpaid if null)
-    const normalizedSettlement = String(settlement || 'all').toLowerCase();
-    if (normalizedSettlement === 'paid') {
-      baseMatch.riderSettlementStatus = 'PAID';
-    } else if (normalizedSettlement === 'unpaid') {
-      baseMatch.$or = [
-        { riderSettlementStatus: 'UNPAID' },
-        { riderSettlementStatus: null },
-        { riderSettlementStatus: { $exists: false } },
-      ];
-    }
-
-    // Search by bookingId / trackingId
     if (search && String(search).trim()) {
       const q = String(search).trim();
-      baseMatch.$and = baseMatch.$and || [];
-      baseMatch.$and.push({
-        $or: [
-          { bookingId: { $regex: q, $options: 'i' } },
-          { trackingId: { $regex: q, $options: 'i' } },
-        ],
-      });
+      where.OR = [
+        { bookingId: { contains: q, mode: 'insensitive' } },
+        { trackingId: { contains: q, mode: 'insensitive' } },
+      ];
     }
 
     const pageNum = Math.max(1, Number(page) || 1);
     const limitNum = Math.min(100, Math.max(1, Number(limit) || 20));
-    const sortDir = sortOrder === 'asc' ? 1 : -1;
+    const orderDir = sortOrder === 'asc' ? 'asc' : 'desc';
 
-    const total = await Order.countDocuments(baseMatch);
-    const orders = await Order.find(baseMatch)
-      .populate('shipper', 'name companyName')
-      .sort({ createdAt: sortDir })
-      .skip((pageNum - 1) * limitNum)
-      .limit(limitNum)
-      .lean();
-
-    const orderIds = orders.map((o) => o._id);
-    const txs = orderIds.length
-      ? await FinancialTransaction.find({
-          order: { $in: orderIds },
-          rider: riderId,
-        }).lean()
-      : [];
-
-    const txByOrder = new Map(txs.map((tx) => [String(tx.order), tx]));
-
-    // Commission config for fallback earning calculation
-    const riderCommissionConfig = await RiderCommissionConfig.findOne({
-      rider: riderId,
-    }).lean();
+    const [total, orders] = await Promise.all([
+      prisma.order.count({ where }),
+      prisma.order.findMany({
+        where,
+        include: {
+          shipper: { select: { companyName: true, name: true } },
+          financialTransaction: true,
+        },
+        orderBy: { createdAt: orderDir },
+        skip: (pageNum - 1) * limitNum,
+        take: limitNum,
+      }),
+    ]);
 
     const summary = {
       deliveredCount: 0,
@@ -515,86 +290,18 @@ exports.getRiderSettlementsAdmin = async (req, res, next) => {
     };
 
     const items = orders.map((o) => {
-      const tx = txByOrder.get(String(o._id));
-      let riderEarning = Number(
-        o.riderEarning !== undefined && o.riderEarning !== null
-          ? o.riderEarning
-          : tx?.riderCommission || 0,
-      );
+      const tx = o.financialTransaction;
 
-      // Same fallback logic as getMyFinance
-      if (((!tx && !o.riderEarning) || riderEarning === 0) && riderCommissionConfig) {
-        const normalizedStatusForOrder = String(o.status || '').trim().toUpperCase();
-        const isDeliveredOrder = normalizedStatusForOrder === 'DELIVERED';
-
-        const collectedCodForOrder = isDeliveredOrder
-          ? (o.amountCollected || o.codAmount || 0)
-          : 0;
-        const originalCodForOrder = Number(o.codAmount || 0);
-
-        const rules = Array.isArray(riderCommissionConfig.rules)
-          ? riderCommissionConfig.rules
-          : [];
-        const normalizedRules = rules.map((r) => ({
-          ...r,
-          _normalizedStatus: String(r.status || '').trim().toUpperCase(),
-        }));
-
-        const rule = normalizedRules.find(
-          (r) => r._normalizedStatus === normalizedStatusForOrder,
-        );
-
-        const applyRule = (type, value, codBase) => {
-          const numericValue = Number(value || 0);
-          if (type === 'PERCENTAGE') {
-            return (Number(codBase || 0) * numericValue) / 100;
-          }
-          return numericValue;
-        };
-
-        if (rule && rule.value !== undefined) {
-          const codBase = isDeliveredOrder
-            ? (o.amountCollected || o.codAmount || 0)
-            : originalCodForOrder;
-          const typeToUse = rule.type || riderCommissionConfig.type || 'FLAT';
-          riderEarning = applyRule(typeToUse, rule.value, codBase);
-        } else if (
-          riderCommissionConfig.type &&
-          riderCommissionConfig.value !== undefined
-        ) {
-          const codBase = isDeliveredOrder
-            ? (o.amountCollected || o.codAmount || 0)
-            : originalCodForOrder;
-          riderEarning = applyRule(
-            riderCommissionConfig.type,
-            riderCommissionConfig.value,
-            codBase,
-          );
-        }
-
-        if (isDeliveredOrder) {
-          const codForClamp = Number(o.amountCollected || o.codAmount || 0);
-          if (codForClamp > 0 && riderEarning > codForClamp) {
-            riderEarning = codForClamp;
-          }
-        }
-      }
-
+      let riderEarning = Number(tx?.riderCommission || 0);
       if (!Number.isFinite(riderEarning) || riderEarning < 0) {
         riderEarning = 0;
       }
 
-      const normalizedOrderSettlement = String(o.riderSettlementStatus || '').toUpperCase();
-      let settlementStatus;
-      if (normalizedOrderSettlement === 'PAID' || normalizedOrderSettlement === 'UNPAID') {
-        settlementStatus = normalizedOrderSettlement === 'PAID' ? 'PAID' : 'UNPAID';
-      } else {
-        const normalizedTxStatus = String(tx?.settlementStatus || '').toUpperCase();
-        settlementStatus =
-          normalizedTxStatus === 'PAID' || normalizedTxStatus === 'SETTLED'
-            ? 'PAID'
-            : 'UNPAID';
-      }
+      const normalizedTxStatus = String(tx?.settlementStatus || '').toUpperCase();
+      const settlementStatus =
+        normalizedTxStatus === 'PAID' || normalizedTxStatus === 'SETTLED'
+          ? 'PAID'
+          : 'UNPAID';
 
       const date = o.deliveredAt || o.updatedAt || o.createdAt;
       const codAmount =
@@ -603,14 +310,15 @@ exports.getRiderSettlementsAdmin = async (req, res, next) => {
           : Number(o.codAmount ?? 0);
 
       const weightKg = Number(o.weightKg || 0);
-      const snap = o.serviceChargesCalcSnapshot || {};
       const min =
-        typeof snap.bracketMin === 'number' && Number.isFinite(snap.bracketMin)
-          ? snap.bracketMin
+        typeof o.serviceChargesBracketMin === 'number' &&
+        Number.isFinite(o.serviceChargesBracketMin)
+          ? o.serviceChargesBracketMin
           : null;
       const max =
-        typeof snap.bracketMax === 'number' && Number.isFinite(snap.bracketMax)
-          ? snap.bracketMax
+        typeof o.serviceChargesBracketMax === 'number' &&
+        Number.isFinite(o.serviceChargesBracketMax)
+          ? o.serviceChargesBracketMax
           : null;
 
       const formatBracketValue = (v) => {
@@ -649,7 +357,7 @@ exports.getRiderSettlementsAdmin = async (req, res, next) => {
       }
 
       return {
-        id: o._id,
+        id: o.id,
         orderId: o.bookingId,
         date,
         shipperName: o.shipper?.companyName || o.shipper?.name || '',
@@ -663,8 +371,8 @@ exports.getRiderSettlementsAdmin = async (req, res, next) => {
         riderEarning,
         status: o.status,
         settlementStatus,
-        riderSettlementAt: o.riderSettlementAt,
-        riderSettlementBy: o.riderSettlementBy,
+        riderSettlementAt: tx?.paidAt || null,
+        riderSettlementBy: tx?.paidById || null,
       };
     });
 

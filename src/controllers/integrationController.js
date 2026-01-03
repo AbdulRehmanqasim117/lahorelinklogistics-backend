@@ -1,10 +1,7 @@
-const IntegrationConfig = require('../models/IntegrationConfig');
-const User = require('../models/User');
-const Order = require('../models/Order');
-const ExternalOrderLink = require('../models/ExternalOrderLink');
 const generateBookingId = require('../config/bookingId');
 const generateTrackingId = require('../config/trackingId');
 const mappers = require('../utils/providerMappers');
+const prisma = require('../prismaClient');
 
 const PROVIDERS = {
   custom: { name: 'CUSTOM', mapper: mappers.mapCustom },
@@ -24,111 +21,150 @@ exports.handleProviderOrder = (providerKey) => async (req, res, next) => {
     const providerMeta = PROVIDERS[providerKey];
     if (!providerMeta) return sendError(res, 404, 'Provider not supported');
 
-    // Use integration data from middleware
+    // Use integration data from middleware (now Prisma-backed)
     const integration = req.integration;
     if (!integration || !integration.shipperId) {
       return sendError(res, 401, 'Unauthorized');
     }
 
     const shipperId = integration.shipperId;
-    const providerName = providerMeta.name;
+    const providerName = providerMeta.name; // matches IntegrationProvider enum values
 
-    console.log('[handleProviderOrder] Processing order for provider:', providerName, 'shipper:', shipperId);
+    console.log(
+      '[handleProviderOrder] Processing order for provider:',
+      providerName,
+      'shipper:',
+      shipperId,
+    );
 
     // Map payload to standard order fields
     const payload = req.body || {};
     const mapped = providerMeta.mapper(payload);
-    // Validate mapped.weightKg
+
     if (!mapped.weightKg || mapped.weightKg <= 0) {
-      return sendError(res, 400, 'weightKg (weight in kg) is required and must be > 0');
+      return sendError(
+        res,
+        400,
+        'weightKg (weight in kg) is required and must be > 0',
+      );
     }
-    console.log('[handleProviderOrder] Mapped payload:', { externalOrderId: mapped.externalOrderId, consigneeName: mapped.consigneeName });
+    console.log('[handleProviderOrder] Mapped payload:', {
+      externalOrderId: mapped.externalOrderId,
+      consigneeName: mapped.consigneeName,
+    });
 
     // Validate presence of externalOrderId to avoid duplicates
     const extId = String(mapped.externalOrderId || '').trim();
     if (!extId) return sendError(res, 400, 'externalOrderId required');
 
-    // Duplicate protection using ExternalOrderLink
-    const existingLink = await ExternalOrderLink.findOne({ 
-      provider: providerName, 
-      externalOrderId: extId, 
-      shipper: shipperId 
-    }).populate('lahorelinkOrder').lean();
+    // Duplicate protection using ExternalOrderLink (Prisma)
+    const existingLink = await prisma.externalOrderLink.findUnique({
+      where: {
+        provider_externalOrderId_shipperId: {
+          provider: providerName,
+          externalOrderId: extId,
+          shipperId,
+        },
+      },
+      include: { lahorelinkOrder: true },
+    });
 
     if (existingLink && existingLink.lahorelinkOrder) {
       console.log('[handleProviderOrder] Duplicate prevented, returning existing order');
       return res.status(200).json({
         message: 'Order already imported',
-        orderId: existingLink.lahorelinkOrder._id,
+        orderId: existingLink.lahorelinkOrder.id,
         bookingId: existingLink.lahorelinkOrder.bookingId,
-        trackingId: existingLink.lahorelinkOrder.trackingId
+        trackingId: existingLink.lahorelinkOrder.trackingId,
       });
     }
 
-    // Generate bookingId & trackingId
     const bookingId = await generateBookingId();
     const trackingId = await generateTrackingId();
 
-    // Commission config logic for weight charges
-    const commissionConfig = await require('../models/CommissionConfig').findOne({ shipper: shipperId });
-    if (!commissionConfig || !Array.isArray(commissionConfig.weightBrackets) || commissionConfig.weightBrackets.length === 0) {
-      return sendError(res, 400, 'No commission weight brackets configured for this shipper');
+    // Commission config logic for weight charges (Prisma CommissionConfig)
+    const commissionConfig = await prisma.commissionConfig.findUnique({
+      where: { shipperId },
+      include: { weightBrackets: true },
+    });
+
+    if (
+      !commissionConfig ||
+      !Array.isArray(commissionConfig.weightBrackets) ||
+      commissionConfig.weightBrackets.length === 0
+    ) {
+      return sendError(
+        res,
+        400,
+        'No commission weight brackets configured for this shipper',
+      );
     }
-    const bracketsSorted = commissionConfig.weightBrackets.slice().sort((a,b)=>a.minKg-b.minKg);
-    const matching = bracketsSorted.find(b => (mapped.weightKg >= b.minKg) && (b.maxKg === null || typeof b.maxKg==='undefined' || mapped.weightKg < b.maxKg));
+
+    const bracketsSorted = commissionConfig.weightBrackets
+      .slice()
+      .sort((a, b) => a.minKg - b.minKg);
+
+    const numericWeight = Number(mapped.weightKg);
+    const matching = bracketsSorted.find((b) => {
+      const withinMin = numericWeight >= b.minKg;
+      const withinMax = b.maxKg == null || numericWeight < b.maxKg;
+      return withinMin && withinMax;
+    });
+
     if (!matching) {
       return sendError(res, 400, 'No weight bracket matched for this shipper');
     }
-    const serviceCharges = matching.charge;
 
-    // Build order doc
-    const orderDoc = {
-      bookingId,
-      trackingId,
-      shipper: shipperId,
-      consigneeName: mapped.consigneeName || '',
-      consigneePhone: mapped.consigneePhone || '',
-      consigneeAddress: mapped.consigneeAddress || '',
-      destinationCity: mapped.destinationCity || '',
-      serviceType: mapped.serviceType || 'SAME_DAY',
-      paymentType: mapped.paymentType || (Number(mapped.codAmount || 0) > 0 ? 'COD' : 'ADVANCE'),
-      codAmount: mapped.paymentType === 'ADVANCE' ? 0 : Number(mapped.codAmount || 0),
-      productDescription: mapped.productDescription || '',
-      pieces: Number(mapped.pieces || 1),
-      fragile: !!mapped.fragile,
-      remarks: mapped.remarks || `Imported via ${providerName}`,
-      externalOrderId: extId,
-      status: 'CREATED',
-      isIntegrated: true,
-      source: 'integrated',
-      shipperApprovalStatus: 'pending',
-      isDeleted: false,
-      bookingState: 'UNBOOKED',
-      statusHistory: [{
+    const serviceCharges = matching.chargePkr;
+
+    const numericCod = Number(mapped.codAmount || 0);
+    const paymentType =
+      mapped.paymentType || (numericCod > 0 ? 'COD' : 'ADVANCE');
+    const codAmount = paymentType === 'ADVANCE' ? 0 : numericCod;
+
+    const createdOrder = await prisma.order.create({
+      data: {
+        bookingId,
+        trackingId,
+        shipperId,
+        consigneeName: mapped.consigneeName || '',
+        consigneePhone: mapped.consigneePhone || '',
+        consigneeAddress: mapped.consigneeAddress || '',
+        destinationCity: mapped.destinationCity || '',
+        serviceType: mapped.serviceType || 'SAME_DAY',
+        paymentType,
+        codAmount,
+        productDescription: mapped.productDescription || '',
+        pieces: Number(mapped.pieces || 1),
+        fragile: !!mapped.fragile,
+        remarks: mapped.remarks || `Imported via ${providerName}`,
+        externalOrderId: extId,
         status: 'CREATED',
-        updatedBy: shipperId,
-        note: `Created via ${providerName} integration`
-      }],
-      weightKg: Number(mapped.weightKg),
-      serviceCharges
-    };
+        isIntegrated: true,
+        source: 'integrated',
+        shipperApprovalStatus: 'pending',
+        isDeleted: false,
+        bookingState: 'UNBOOKED',
+        weightKg: numericWeight,
+        serviceCharges,
+        totalAmount: codAmount + serviceCharges,
+      },
+    });
 
-    const created = await Order.create(orderDoc);
-    console.log('[handleProviderOrder] Order created:', { id: created._id, bookingId: created.bookingId, trackingId: created.trackingId });
-
-    // Create ExternalOrderLink for duplicate prevention
-    await ExternalOrderLink.create({
-      provider: providerName,
-      externalOrderId: extId,
-      shipper: shipperId,
-      lahorelinkOrder: created._id
+    await prisma.externalOrderLink.create({
+      data: {
+        provider: providerName,
+        externalOrderId: extId,
+        shipperId,
+        lahorelinkOrderId: createdOrder.id,
+      },
     });
 
     return res.status(201).json({
       message: 'Order created',
-      orderId: created._id,
-      bookingId: created.bookingId,
-      trackingId: created.trackingId
+      orderId: createdOrder.id,
+      bookingId: createdOrder.bookingId,
+      trackingId: createdOrder.trackingId,
     });
   } catch (err) {
     console.error('[handleProviderOrder] Error:', err);
@@ -146,38 +182,39 @@ exports.createFromProvider = (req, res, next) => {
 // Shipper-managed endpoints
 exports.getMyIntegration = async (req, res, next) => {
   try {
-    const shipperId = req.user && (req.user._id || req.user.id);
-    if (!shipperId) return sendError(res, 401, 'Unauthorized');
+    const shipperIdRaw = req.user && (req.user._id || req.user.id);
+    const shipperId = Number(shipperIdRaw);
+    if (!Number.isInteger(shipperId) || shipperId <= 0) {
+      return sendError(res, 401, 'Unauthorized');
+    }
 
-    let config = await IntegrationConfig.findOne({ shipper: shipperId }).lean();
+    let config = await prisma.integrationConfig.findUnique({
+      where: { shipperId },
+    });
+
     if (!config) {
-      // Create new config with generated API key
-      const apiKey = generateApiKey();
-      const newConfig = await IntegrationConfig.create({ 
-        shipper: shipperId, 
-        apiKey, 
-        enabled: false, 
-        providers: [] 
+      config = await prisma.integrationConfig.create({
+        data: {
+          shipperId,
+          apiKey: generateApiKey(),
+          enabled: false,
+          providers: [],
+        },
       });
-      config = newConfig.toObject ? newConfig.toObject() : newConfig;
     }
 
-    // Ensure apiKey exists (should always exist, but safety check)
     if (!config.apiKey) {
-      const apiKey = generateApiKey();
-      config = await IntegrationConfig.findOneAndUpdate(
-        { shipper: shipperId },
-        { $set: { apiKey } },
-        { new: true }
-      ).lean();
+      config = await prisma.integrationConfig.update({
+        where: { shipperId },
+        data: { apiKey: generateApiKey() },
+      });
     }
 
-    // Return in format expected by frontend
     return res.json({
-      shipper: config.shipper,
+      shipper: shipperId,
       apiKey: config.apiKey,
       enabled: config.enabled || false,
-      providers: config.providers || []
+      providers: config.providers || [],
     });
   } catch (err) {
     console.error('[getMyIntegration] Error:', err);
@@ -187,93 +224,86 @@ exports.getMyIntegration = async (req, res, next) => {
 
 exports.updateMyIntegration = async (req, res, next) => {
   try {
-    const shipperId = req.user && (req.user._id || req.user.id);
-    if (!shipperId) return sendError(res, 401, 'Unauthorized');
+    const shipperIdRaw = req.user && (req.user._id || req.user.id);
+    const shipperId = Number(shipperIdRaw);
+    if (!Number.isInteger(shipperId) || shipperId <= 0) {
+      return sendError(res, 401, 'Unauthorized');
+    }
 
     const body = req.body || {};
-    
-    // Get existing config or create new one
-    let config = await IntegrationConfig.findOne({ shipper: shipperId });
-    
+
+    let config = await prisma.integrationConfig.findUnique({ where: { shipperId } });
     if (!config) {
-      // Create new config with API key
-      const apiKey = generateApiKey();
-      config = await IntegrationConfig.create({ 
-        shipper: shipperId, 
-        apiKey, 
-        enabled: false, 
-        providers: [] 
+      config = await prisma.integrationConfig.create({
+        data: {
+          shipperId,
+          apiKey: generateApiKey(),
+          enabled: false,
+          providers: [],
+        },
       });
     }
 
-    // Build update object
     const update = {};
     if (typeof body.enabled === 'boolean') {
       update.enabled = body.enabled;
     }
-    
+
     if (Array.isArray(body.providers)) {
-      // Normalize providers array - ensure all valid providers are included
       const validProviders = ['SHOPIFY', 'WOOCOMMERCE', 'CUSTOM'];
       const providedMap = new Map();
-      
-      // Process provided providers
-      body.providers.forEach(p => {
+
+      body.providers.forEach((p) => {
         const providerName = String(p.provider || '').toUpperCase();
         if (validProviders.includes(providerName)) {
           providedMap.set(providerName, {
             provider: providerName,
             enabled: !!p.enabled,
-            settings: p.settings || {}
+            settings: p.settings || {},
           });
         }
       });
-      
-      // Add any existing providers that weren't provided (preserve their state)
-      (config.providers || []).forEach(p => {
+
+      (config.providers || []).forEach((p) => {
         const name = String(p.provider || '').toUpperCase();
         if (validProviders.includes(name) && !providedMap.has(name)) {
           providedMap.set(name, {
             provider: name,
             enabled: !!p.enabled,
-            settings: p.settings || {}
+            settings: p.settings || {},
           });
         }
       });
-      
-      // Ensure all valid providers are present (default to disabled if missing)
-      validProviders.forEach(name => {
+
+      validProviders.forEach((name) => {
         if (!providedMap.has(name)) {
           providedMap.set(name, {
             provider: name,
             enabled: false,
-            settings: {}
+            settings: {},
           });
         }
       });
-      
+
       update.providers = Array.from(providedMap.values());
     }
 
-    // Update the config
-    config = await IntegrationConfig.findOneAndUpdate(
-      { shipper: shipperId }, 
-      { $set: update }, 
-      { new: true }
-    );
-
-    console.log('[updateMyIntegration] Updated config:', { 
-      shipper: shipperId, 
-      enabled: config.enabled, 
-      providers: config.providers 
+    config = await prisma.integrationConfig.update({
+      where: { shipperId },
+      data: update,
     });
 
-    // Return in format expected by frontend
+    console.log('[updateMyIntegration] Updated config:', {
+      shipper: shipperId,
+      enabled: config.enabled,
+      providers: config.providers,
+    });
+
     return res.json({
-      shipper: config.shipper,
+      shipper: shipperId,
       apiKey: config.apiKey,
       enabled: config.enabled,
-      providers: config.providers || []
+      providers: config.providers || [],
     });
   } catch (err) {
     console.error('[updateMyIntegration] Error:', err);
@@ -283,18 +313,26 @@ exports.updateMyIntegration = async (req, res, next) => {
 
 exports.regenerateKey = async (req, res, next) => {
   try {
-    const shipperId = req.user && (req.user._id || req.user.id);
-    if (!shipperId) return sendError(res, 401, 'Unauthorized');
+    const shipperIdRaw = req.user && (req.user._id || req.user.id);
+    const shipperId = Number(shipperIdRaw);
+    if (!Number.isInteger(shipperId) || shipperId <= 0) {
+      return sendError(res, 401, 'Unauthorized');
+    }
 
     const newKey = generateApiKey();
-    const config = await IntegrationConfig.findOneAndUpdate(
-      { shipper: shipperId }, 
-      { $set: { apiKey: newKey } }, 
-      { new: true, upsert: true }
-    );
-    
+    const config = await prisma.integrationConfig.upsert({
+      where: { shipperId },
+      update: { apiKey: newKey },
+      create: {
+        shipperId,
+        apiKey: newKey,
+        enabled: false,
+        providers: [],
+      },
+    });
+
     console.log('[regenerateKey] API key regenerated for shipper:', shipperId);
-    
+
     return res.json({ message: 'API key regenerated', apiKey: config.apiKey });
   } catch (err) {
     console.error('[regenerateKey] Error:', err);

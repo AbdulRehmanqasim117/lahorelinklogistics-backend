@@ -1,15 +1,21 @@
-const CommissionConfig = require('../models/CommissionConfig');
+const prisma = require('../prismaClient');
 
 module.exports = async function requireCommissionApproved(req, res, next) {
   try {
+    // Only gate shipper accounts; all other roles continue as normal
     if (!req.user || req.user.role !== 'SHIPPER') {
       return next();
     }
 
-    const shipperId = req.user.id || req.user._id;
-    const cfg = await CommissionConfig.findOne({ shipper: shipperId })
-      .select('weightBrackets')
-      .lean();
+    const shipperIdNum = Number(req.user.id);
+    if (!shipperIdNum || !Number.isInteger(shipperIdNum)) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const cfg = await prisma.commissionConfig.findUnique({
+      where: { shipperId: shipperIdNum },
+      include: { weightBrackets: true },
+    });
 
     const hasWeightBrackets =
       cfg && Array.isArray(cfg.weightBrackets) && cfg.weightBrackets.length > 0;

@@ -36,7 +36,7 @@ if (!HAS_ADMIN_SEED_ENVS) {
   );
 }
 
-// Connect to database
+// Connect to database (Prisma/MySQL only)
 const dbReady = connectDB();
 
 const app = express();
