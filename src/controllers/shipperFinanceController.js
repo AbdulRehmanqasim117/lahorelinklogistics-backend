@@ -74,6 +74,7 @@ exports.getMyFinanceSummary = async (req, res, next) => {
           cnic: user.cnic || user.cnicNumber || null,
           iban: user.iban || null,
           bankName: user.bankName || null,
+          accountType: user.accountType || null,
           accountNumber: user.accountNumber || null,
           accountHolderName: user.accountHolderName || null,
           createdAt: user.createdAt,

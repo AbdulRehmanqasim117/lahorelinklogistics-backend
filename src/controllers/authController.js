@@ -78,6 +78,7 @@ exports.signup = async (req, res, next) => {
       bankAccountDetails,
       // Structured bank fields (preferred)
       bankName,
+      accountType,
       accountHolderName,
       accountNumber,
       iban,
@@ -112,6 +113,7 @@ exports.signup = async (req, res, next) => {
 
       // Structured bank fields
       payload.bankName = bankName || '';
+      payload.accountType = accountType || '';
       payload.accountHolderName = accountHolderName || '';
       payload.accountNumber = accountNumber || '';
       payload.iban = iban || '';
@@ -121,6 +123,7 @@ exports.signup = async (req, res, next) => {
         payload.bankAccountDetails = bankAccountDetails.trim();
       } else {
         const parts = [];
+        if (accountType) parts.push(accountType.trim());
         if (accountHolderName) parts.push(accountHolderName.trim());
         if (accountNumber) parts.push(accountNumber.trim());
         if (iban) parts.push(iban.trim());

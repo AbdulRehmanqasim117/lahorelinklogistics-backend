@@ -40,6 +40,7 @@ const userSchema = new mongoose.Schema({
   pickupAddress: { type: String },
   bankAccountDetails: { type: String },
   bankName: { type: String },
+  accountType: { type: String },
   accountHolderName: { type: String },
   accountNumber: { type: String },
   iban: { type: String },

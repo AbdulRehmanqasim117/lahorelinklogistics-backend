@@ -121,6 +121,7 @@ model User {
   pickupAddress       String?
   bankAccountDetails  String?
   bankName            String?
+  accountType         String?
   accountHolderName   String?
   accountNumber       String?
   iban                String?

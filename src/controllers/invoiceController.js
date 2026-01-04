@@ -113,6 +113,7 @@ const mapShipperForInvoice = (user) => {
     phone: user.phone || user.contactNumber || null,
     address: user.pickupAddress || null,
     bankName: user.bankName || null,
+    accountType: user.accountType || null,
     accountHolderName: user.accountHolderName || null,
     accountNumber: user.accountNumber || null,
     iban: user.iban || null,
