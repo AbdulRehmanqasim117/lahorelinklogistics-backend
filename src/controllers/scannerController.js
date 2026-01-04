@@ -1,8 +1,5 @@
-const Order = require("../models/Order");
-const {
-  recalculateAndUpdateServiceCharges,
-  validateWeight,
-} = require("../utils/serviceChargeCalculator");
+const prisma = require("../prismaClient");
+const { calculateServiceCharges, validateWeight } = require("../utils/serviceChargeCalculator");
 
 /**
  * Get order details for warehouse scan confirmation
@@ -26,12 +23,30 @@ exports.getOrderForScan = async (req, res, next) => {
       }
     }
 
-    // Find order by bookingId
-    const order = await Order.findOne({ bookingId: extractedBookingId })
-      .populate("shipper", "name email companyName")
-      .populate("assignedRider", "name")
-      .populate("weightVerifiedBy", "name")
-      .populate("warehouseReceivedBy", "name");
+    // Find order by bookingId (Prisma)
+    const order = await prisma.order.findFirst({
+      where: {
+        bookingId: extractedBookingId,
+        isDeleted: false,
+      },
+      include: {
+        shipper: {
+          select: { id: true, name: true, email: true, companyName: true, phone: true },
+        },
+        assignedRider: {
+          select: { id: true, name: true },
+        },
+        weightVerifiedBy: {
+          select: { id: true, name: true },
+        },
+        warehouseReceivedBy: {
+          select: { id: true, name: true },
+        },
+        invoice: {
+          select: { id: true },
+        },
+      },
+    });
 
     if (!order) {
       return res.status(404).json({
@@ -52,13 +67,14 @@ exports.getOrderForScan = async (req, res, next) => {
     }
 
     // Check if order is already invoiced (prevents weight changes)
-    const isInvoiced = order.invoice !== null;
+    const isInvoiced = order.invoiceId != null;
 
     res.json({
       success: true,
       data: {
         order: {
-          _id: order._id,
+          _id: order.id,
+          id: order.id,
           bookingId: order.bookingId,
           consigneeName: order.consigneeName,
           destinationCity: order.destinationCity,
@@ -93,7 +109,16 @@ exports.warehouseScan = async (req, res, next) => {
   try {
     const { bookingId } = req.params;
     const { scannedWeightKg } = req.body;
-    const userId = req.user.id || req.user._id;
+
+    const userIdRaw = req.user && (req.user.id || req.user._id);
+    const userId = Number(userIdRaw);
+
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized",
+      });
+    }
 
     if (!bookingId) {
       return res.status(400).json({
@@ -111,10 +136,21 @@ exports.warehouseScan = async (req, res, next) => {
       }
     }
 
-    // Find order
-    const order = await Order.findOne({
-      bookingId: extractedBookingId,
-    }).populate("shipper", "name email companyName");
+    // Find order (Prisma)
+    const order = await prisma.order.findFirst({
+      where: {
+        bookingId: extractedBookingId,
+        isDeleted: false,
+      },
+      include: {
+        shipper: {
+          select: { id: true, name: true, email: true, companyName: true, phone: true },
+        },
+        invoice: {
+          select: { id: true },
+        },
+      },
+    });
 
     if (!order) {
       return res.status(404).json({
@@ -135,7 +171,7 @@ exports.warehouseScan = async (req, res, next) => {
     }
 
     // Check if already invoiced
-    if (order.invoice !== null) {
+    if (order.invoiceId != null) {
       return res.status(400).json({
         success: false,
         message: "Order already paid; cannot change weight",
@@ -156,58 +192,107 @@ exports.warehouseScan = async (req, res, next) => {
     }
 
     // Determine if weight is being updated
+    const currentWeight = Number(order.weightKg || 0);
     const newWeight =
-      scannedWeightKg !== undefined ? Number(scannedWeightKg) : order.weightKg;
-    const isWeightChanged = newWeight !== order.weightKg;
+      scannedWeightKg !== undefined && scannedWeightKg !== null
+        ? Number(scannedWeightKg)
+        : currentWeight;
+    const isWeightChanged = newWeight !== currentWeight;
 
-    // If weight is changing, recalculate service charges
+    let statusChanged = false;
+    let oldWeightForResponse = currentWeight;
+
+    // Build update payload
+    const updateData = {};
+
     if (isWeightChanged) {
-      await recalculateAndUpdateServiceCharges(order, newWeight, userId);
+      // Preserve original weight if not set
+      if (order.weightOriginalKg == null && currentWeight !== newWeight) {
+        updateData.weightOriginalKg = currentWeight;
+      }
+
+      // Calculate new service charges using Prisma-based calculator
+      const { serviceCharges, snapshot } = await calculateServiceCharges(order, newWeight);
+
+      updateData.weightKg = newWeight;
+      updateData.weightVerifiedById = userId;
+      updateData.weightVerifiedAt = new Date();
+      updateData.weightSource = "WAREHOUSE_SCAN";
+      updateData.serviceCharges = serviceCharges;
+
+      if (snapshot) {
+        updateData.serviceChargesWeightUsed = snapshot.weightUsed;
+        updateData.serviceChargesBracketMin = snapshot.bracketMin;
+        updateData.serviceChargesBracketMax = snapshot.bracketMax;
+        updateData.serviceChargesRate = snapshot.rate;
+        updateData.serviceChargesCalculatedAt = snapshot.calculatedAt || new Date();
+      }
+
+      const codBase =
+        order.paymentType === "ADVANCE" ? 0 : Number(order.codAmount || 0);
+      updateData.totalAmount = codBase + Number(serviceCharges || 0);
     }
 
     // Update warehouse status if not already set
-    let statusChanged = false;
     if (order.status !== "AT_LLL_WAREHOUSE") {
-      order.status = "AT_LLL_WAREHOUSE";
-      order.statusHistory.push({
-        status: "AT_LLL_WAREHOUSE",
-        timestamp: new Date(),
-        updatedBy: userId,
-        note: isWeightChanged
-          ? `Scanned into warehouse with weight verification (${order.weightKg}kg)`
-          : "Scanned into warehouse",
-      });
+      updateData.status = "AT_LLL_WAREHOUSE";
       statusChanged = true;
     }
 
     // Update warehouse tracking
     if (!order.warehouseReceivedAt) {
-      order.warehouseReceivedAt = new Date();
-      order.warehouseReceivedBy = userId;
+      updateData.warehouseReceivedAt = new Date();
+      updateData.warehouseReceivedById = userId;
     }
 
-    // Save the order
-    await order.save();
+    // Persist updates via Prisma
+    const updatedOrder = await prisma.order.update({
+      where: { id: order.id },
+      data: updateData,
+      include: {
+        shipper: {
+          select: { id: true, name: true, email: true, companyName: true, phone: true },
+        },
+        assignedRider: {
+          select: { id: true, name: true },
+        },
+        weightVerifiedBy: {
+          select: { id: true, name: true },
+        },
+        warehouseReceivedBy: {
+          select: { id: true, name: true },
+        },
+      },
+    });
 
-    // Return updated order with populated fields
-    const updatedOrder = await Order.findById(order._id)
-      .populate("shipper", "name email companyName")
-      .populate("assignedRider", "name")
-      .populate("weightVerifiedBy", "name")
-      .populate("warehouseReceivedBy", "name");
+    // Record an order event for audit trail if status changed
+    if (statusChanged) {
+      const note = isWeightChanged
+        ? `Scanned into warehouse with weight verification (${currentWeight}kg → ${newWeight}kg)`
+        : "Scanned into warehouse";
+
+      await prisma.orderEvent.create({
+        data: {
+          orderId: order.id,
+          status: "AT_LLL_WAREHOUSE",
+          note,
+          createdById: userId,
+        },
+      });
+    }
 
     res.json({
       success: true,
       message: "Order successfully scanned into warehouse",
       data: {
-        order: updatedOrder,
+        order: {
+          ...updatedOrder,
+          _id: updatedOrder.id,
+        },
         changes: {
           statusChanged,
           weightChanged: isWeightChanged,
-          oldWeight: isWeightChanged
-            ? order.weightChangeLog[order.weightChangeLog.length - 1]
-                ?.oldWeightKg
-            : null,
+          oldWeight: isWeightChanged ? oldWeightForResponse : null,
           newWeight: isWeightChanged ? newWeight : null,
           serviceChargesRecalculated: isWeightChanged,
         },

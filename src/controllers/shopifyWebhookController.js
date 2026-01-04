@@ -1,6 +1,5 @@
 const crypto = require('crypto');
-const IntegratedOrder = require('../models/IntegratedOrder');
-const ShipperIntegration = require('../models/ShipperIntegration');
+const prisma = require('../prismaClient');
 
 const getWebhookSecret = () => {
   return (
@@ -132,11 +131,13 @@ exports.handleShopifyWebhook = async (req, res) => {
       }
     }
 
-    const integration = await ShipperIntegration.findOne({
-      provider: 'SHOPIFY',
-      shopDomain,
-      status: 'active',
-    }).lean();
+    const integration = await prisma.shipperIntegration.findFirst({
+      where: {
+        provider: 'SHOPIFY',
+        shopDomain,
+        status: 'active',
+      },
+    });
 
     if (!integration) {
       console.log('[ShopifyWebhook] No active ShipperIntegration for shop', {
@@ -146,16 +147,20 @@ exports.handleShopifyWebhook = async (req, res) => {
       return res.status(200).send('No integration for shop');
     }
 
-    const shipperId = integration.shipper;
+    const shipperId = integration.shipperId;
 
-    const criteria = {
-      shipper: shipperId,
-      provider: 'SHOPIFY',
-      shopDomain,
-      providerOrderId: orderId,
+    const whereUnique = {
+      shipperId_provider_shopDomain_providerOrderId: {
+        shipperId,
+        provider: 'SHOPIFY',
+        shopDomain,
+        providerOrderId: orderId,
+      },
     };
 
-    const existing = await IntegratedOrder.findOne(criteria).lean();
+    const existing = await prisma.integratedOrder.findUnique({
+      where: whereUnique,
+    });
 
     const updatedAt =
       payload.updated_at || payload.processed_at || payload.created_at || null;
@@ -181,18 +186,15 @@ exports.handleShopifyWebhook = async (req, res) => {
           webhookId,
         });
 
-        await IntegratedOrder.updateOne(
-          criteria,
-          {
-            $inc: { webhookDeliveryCount: 1 },
-            $set: {
-              lastWebhookId: webhookId || existing.lastWebhookId || null,
-              lastWebhookAt: webhookCreatedAt,
-              lastPayloadHash: payloadHash,
-            },
+        await prisma.integratedOrder.update({
+          where: whereUnique,
+          data: {
+            webhookDeliveryCount: { increment: 1 },
+            lastWebhookId: webhookId || existing.lastWebhookId || null,
+            lastWebhookAt: webhookCreatedAt,
+            lastPayloadHash: payloadHash,
           },
-          { upsert: true },
-        );
+        });
 
         return res.status(200).send('OK');
       }
@@ -201,7 +203,7 @@ exports.handleShopifyWebhook = async (req, res) => {
     const mapped = mapShopifyToIntegratedOrder(payload);
 
     const update = {
-      shipper: shipperId,
+      shipperId,
       provider: 'SHOPIFY',
       shopDomain,
       providerOrderNumber: String(payload.order_number || payload.name || ''),
@@ -217,18 +219,26 @@ exports.handleShopifyWebhook = async (req, res) => {
       update.tags = ['cancelled'];
     }
 
-    const integratedOrder = await IntegratedOrder.findOneAndUpdate(
-      criteria,
-      {
-        $set: update,
-        $setOnInsert: { importedAt: new Date(), lllBookingStatus: 'NOT_BOOKED' },
-        $inc: { webhookDeliveryCount: 1 },
+    const integratedOrder = await prisma.integratedOrder.upsert({
+      where: whereUnique,
+      update: {
+        ...update,
+        webhookDeliveryCount: { increment: 1 },
       },
-      { new: true, upsert: true },
-    );
+      create: {
+        shipperId,
+        provider: 'SHOPIFY',
+        shopDomain,
+        providerOrderId: orderId,
+        importedAt: webhookCreatedAt,
+        lllBookingStatus: 'NOT_BOOKED',
+        webhookDeliveryCount: 1,
+        ...update,
+      },
+    });
 
     console.log('[ShopifyWebhook] Upserted integrated order', {
-      id: integratedOrder._id,
+      id: integratedOrder.id,
       shipper: String(shipperId),
       shopDomain,
       topic,

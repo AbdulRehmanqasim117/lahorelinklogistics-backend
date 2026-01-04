@@ -1,10 +1,3 @@
-const mongoose = require('mongoose');
-const Order = require('../models/Order');
-const User = require('../models/User');
-const CommissionConfig = require('../models/CommissionConfig');
-const ShipperProfile = require('../models/ShipperProfile');
-const ShipperLedger = require('../models/ShipperLedger');
-const { calculateServiceCharges } = require('../utils/serviceChargeCalculator');
 const prisma = require('../prismaClient');
 
 const formatPolicy = (cfg) => {
@@ -23,88 +16,6 @@ const formatPolicy = (cfg) => {
         charge: b.chargePkr !== undefined ? b.chargePkr : b.charge,
       })),
   };
-};
-
-const ensureLedgerBackfilled = async (shipperId) => {
-  const existingCount = await ShipperLedger.countDocuments({ shipperId });
-  if (existingCount > 0) return;
-
-  const visibilityFilter = {
-    $or: [
-      // Normal/manual orders (including legacy ones without flags)
-      { isIntegrated: { $ne: true } },
-      // Integrated orders: only booked + approved should ever hit the ledger
-      {
-        isIntegrated: true,
-        bookingState: 'BOOKED',
-        $or: [{ shipperApprovalStatus: 'approved' }, { shipperApprovalStatus: { $exists: false } }],
-      },
-    ],
-  };
-
-  const orders = await Order.find({
-    shipper: shipperId,
-    status: { $in: ['DELIVERED', 'RETURNED'] },
-    isDeleted: { $ne: true },
-    ...visibilityFilter,
-  })
-    .select(
-      '_id shipper bookingId consigneeName status deliveredAt updatedAt createdAt amountCollected codAmount serviceCharges invoice weightKg',
-    )
-    .lean();
-
-  if (!orders.length) return;
-
-  const ops = [];
-  for (const order of orders) {
-    if (!order?.bookingId) continue;
-
-    const isDelivered = order.status === 'DELIVERED';
-    const cod = isDelivered ? Number(order.amountCollected ?? order.codAmount ?? 0) : 0;
-
-    let serviceCharges = Number(order.serviceCharges || 0);
-    if (!serviceCharges || serviceCharges < 0) {
-      const calc = await calculateServiceCharges(order, order.weightKg);
-      serviceCharges = Number(calc?.serviceCharges || 0);
-    }
-
-    const receivable = Number(cod) - Number(serviceCharges);
-    const date =
-      (isDelivered ? order.deliveredAt : null) || order.updatedAt || order.createdAt || new Date();
-
-    const payload = {
-      shipperId: order.shipper,
-      date,
-      type: 'ORDER',
-      orderId: order._id,
-      bookingId: order.bookingId,
-      particular: order.consigneeName || 'Order',
-      codAmount: cod,
-      serviceCharges,
-      weightKg: order.weightKg,
-      receivable,
-      amount: receivable,
-      status: 'UNPAID',
-      createdBy: 'system',
-    };
-
-    ops.push({
-      updateOne: {
-        filter: { shipperId: order.shipper, type: 'ORDER', bookingId: order.bookingId },
-        update: { $set: payload },
-        upsert: true,
-      },
-    });
-  }
-
-  const batchSize = 500;
-  for (let i = 0; i < ops.length; i += batchSize) {
-    try {
-      await ShipperLedger.bulkWrite(ops.slice(i, i + batchSize), { ordered: false });
-    } catch (e) {
-      // Ignore duplicate key errors / partial failures; upserts are idempotent.
-    }
-  }
 };
 
 exports.getMyFinanceSummary = async (req, res, next) => {

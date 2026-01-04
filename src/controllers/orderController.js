@@ -1,9 +1,3 @@
-// Legacy Mongoose models are kept only for a few finance-related side effects.
-// Core order CRUD and listing logic has been migrated to Prisma.
-// const Order = require('../models/Order');
-// const CommissionConfig = require('../models/CommissionConfig');
-// const FinancialTransaction = require('../models/FinancialTransaction');
-// const RiderProfile = require('../models/RiderProfile');
 const generateBookingId = require('../config/bookingId');
 const generateTrackingId = require('../config/trackingId');
 const QRCode = require('qrcode');

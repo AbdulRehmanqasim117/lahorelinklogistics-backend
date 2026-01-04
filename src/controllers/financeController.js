@@ -1,9 +1,3 @@
-const mongoose = require('mongoose');
-// Legacy Mongoose models are still used for some older finance flows,
-// but company finance summary/ledger calculations (including periods) are now Prisma-based.
-// const FinancialTransaction = require('../models/FinancialTransaction');
-// const Order = require('../models/Order');
-// const User = require('../models/User');
 const prisma = require('../prismaClient');
 
 async function getOrCreateActiveFinancePeriod(userId) {

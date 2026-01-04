@@ -1,7 +1,3 @@
-const mongoose = require('mongoose');
-const Order = require('../models/Order');
-const FinancialTransaction = require('../models/FinancialTransaction');
-const RiderCommissionConfig = require('../models/RiderCommissionConfig');
 const prisma = require('../prismaClient');
 
 // GET /api/riders/finance/me

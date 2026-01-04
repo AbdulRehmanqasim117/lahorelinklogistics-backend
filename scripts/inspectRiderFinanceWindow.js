@@ -1,4 +1,3 @@
-const mongoose = require('mongoose');
 const connectDB = require('../src/config/db');
 const Order = require('../src/models/Order');
 const FinancialTransaction = require('../src/models/FinancialTransaction');

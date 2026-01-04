@@ -1,118 +1,90 @@
-const CommissionConfig = require('../models/CommissionConfig');
+const prisma = require('../prismaClient');
 
 /**
- * Calculate service charges based on weight and shipper's weight brackets
- * @param {Object} order - Order object with shipper and weightKg
- * @param {Number} weightKg - Weight in kg (optional, uses order.weightKg if not provided)
- * @returns {Object} - { serviceCharges, snapshot }
+ * Calculate service charges based on weight and shipper's weight brackets (Prisma-based).
+ *
+ * @param {Object} order - Order-like object with at least shipperId (or shipper.id) and weightKg
+ * @param {number|null} weightKg - Explicit weight in kg (optional, falls back to order.weightKg)
+ * @returns {Promise<{ serviceCharges: number, snapshot: object|null }>}
  */
 const calculateServiceCharges = async (order, weightKg = null) => {
   try {
-    const weight = weightKg || order.weightKg;
-    const shipperId = order.shipper?._id || order.shipper;
+    const weight =
+      weightKg != null && !Number.isNaN(Number(weightKg))
+        ? Number(weightKg)
+        : Number(order.weightKg || 0);
 
-    if (!shipperId || !weight) {
+    const shipperId =
+      (order && (order.shipperId || order.shipper_id)) ||
+      (order && order.shipper && (order.shipper.id || order.shipper.shipperId));
+
+    if (!shipperId || !weight || weight <= 0) {
       return {
         serviceCharges: 0,
-        snapshot: null
+        snapshot: null,
       };
     }
 
-    // Get commission config for the shipper
-    const commissionConfig = await CommissionConfig.findOne({ shipper: shipperId });
+    const commissionConfig = await prisma.commissionConfig.findUnique({
+      where: { shipperId: Number(shipperId) },
+      include: { weightBrackets: true },
+    });
 
-    if (!commissionConfig || !Array.isArray(commissionConfig.weightBrackets) || commissionConfig.weightBrackets.length === 0) {
-      console.warn(`No weight brackets found for shipper ${shipperId}`);
+    if (
+      !commissionConfig ||
+      !Array.isArray(commissionConfig.weightBrackets) ||
+      commissionConfig.weightBrackets.length === 0
+    ) {
+      console.warn(`[ServiceChargeCalculator] No weight brackets found for shipper ${shipperId}`);
       return {
         serviceCharges: 0,
-        snapshot: null
+        snapshot: null,
       };
     }
 
-    // Find matching weight bracket
-    const matchingBracket = commissionConfig.weightBrackets.find(bracket => {
-      const withinMin = weight >= bracket.minKg;
-      const withinMax = bracket.maxKg === null || bracket.maxKg === undefined || weight <= bracket.maxKg;
+    const bracketsSorted = commissionConfig.weightBrackets
+      .slice()
+      .sort((a, b) => Number(a.minKg || 0) - Number(b.minKg || 0));
+
+    const matchingBracket = bracketsSorted.find((bracket) => {
+      const min = Number(bracket.minKg || 0);
+      const max =
+        bracket.maxKg === null || typeof bracket.maxKg === 'undefined'
+          ? null
+          : Number(bracket.maxKg);
+      const withinMin = weight >= min;
+      const withinMax = max === null ? true : weight < max;
       return withinMin && withinMax;
     });
 
     if (!matchingBracket) {
-      console.warn(`No matching weight bracket found for weight ${weight}kg and shipper ${shipperId}`);
+      console.warn(
+        `[ServiceChargeCalculator] No matching weight bracket for weight ${weight}kg and shipper ${shipperId}`,
+      );
       return {
         serviceCharges: 0,
-        snapshot: null
+        snapshot: null,
       };
     }
 
-    // Create calculation snapshot for audit
     const snapshot = {
       weightUsed: weight,
       bracketMin: matchingBracket.minKg,
       bracketMax: matchingBracket.maxKg,
-      rate: matchingBracket.charge,
-      calculatedAt: new Date()
+      rate: matchingBracket.chargePkr,
+      calculatedAt: new Date(),
     };
 
     return {
-      serviceCharges: matchingBracket.charge,
-      snapshot
+      serviceCharges: Number(matchingBracket.chargePkr || 0),
+      snapshot,
     };
   } catch (error) {
-    console.error('Error calculating service charges:', error);
+    console.error('[ServiceChargeCalculator] Error calculating service charges (Prisma):', error);
     return {
       serviceCharges: 0,
-      snapshot: null
+      snapshot: null,
     };
-  }
-};
-
-/**
- * Recalculate service charges for an order and update the order
- * @param {Object} order - Mongoose order document
- * @param {Number} newWeightKg - New weight in kg
- * @param {String} userId - User ID who made the change
- * @returns {Object} - Updated order with new service charges
- */
-const recalculateAndUpdateServiceCharges = async (order, newWeightKg, userId) => {
-  try {
-    // Store original weight if not already stored
-    if (!order.weightOriginalKg && order.weightKg !== newWeightKg) {
-      order.weightOriginalKg = order.weightKg;
-    }
-
-    // Store weight change in audit log
-    if (order.weightKg !== newWeightKg) {
-      order.weightChangeLog.push({
-        oldWeightKg: order.weightKg,
-        newWeightKg: newWeightKg,
-        changedBy: userId,
-        changedAt: new Date(),
-        reason: 'Warehouse scan weight verification'
-      });
-    }
-
-    // Update weight
-    order.weightKg = newWeightKg;
-    order.weightVerifiedBy = userId;
-    order.weightVerifiedAt = new Date();
-    order.weightSource = 'WAREHOUSE_SCAN';
-
-    // Calculate new service charges
-    const { serviceCharges, snapshot } = await calculateServiceCharges(order, newWeightKg);
-
-    // Update service charges and snapshot
-    order.serviceCharges = serviceCharges;
-    if (snapshot) {
-      order.serviceChargesCalcSnapshot = snapshot;
-    }
-
-    // Update total amount (COD + service charges)
-    order.totalAmount = (order.paymentType === 'ADVANCE' ? 0 : Number(order.codAmount || 0)) + serviceCharges;
-
-    return order;
-  } catch (error) {
-    console.error('Error recalculating service charges:', error);
-    throw error;
   }
 };
 
@@ -152,6 +124,5 @@ const validateWeight = (weight, maxWeight = 50) => {
 
 module.exports = {
   calculateServiceCharges,
-  recalculateAndUpdateServiceCharges,
   validateWeight
 };
