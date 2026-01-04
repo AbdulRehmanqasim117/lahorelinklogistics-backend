@@ -69,10 +69,12 @@ router.patch(
   orderController.bookOrder,
 );
 
-// Shipper: list pending integrated orders (approval required)
+// Pending integrated orders:
+// - SHIPPER sees their own pending integrated orders (gated by commission config)
+// - CEO / MANAGER see all pending integrated orders across shippers
 router.get(
   "/integrated/pending",
-  requireRole("SHIPPER"),
+  requireRole("SHIPPER", "CEO", "MANAGER"),
   requireCommissionApproved,
   orderController.getPendingIntegratedOrdersForShipper,
 );

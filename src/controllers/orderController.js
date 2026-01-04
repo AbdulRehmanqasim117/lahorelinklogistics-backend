@@ -1092,20 +1092,42 @@ const assignByScan = async (req, res, next) => {
 
 const getPendingIntegratedOrdersForShipper = async (req, res, next) => {
   try {
-    const shipperId = req.user.id;
-    if (!shipperId) {
+    const user = req.user;
+    if (!user) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
+    const where = {
+      isIntegrated: true,
+      bookingState: 'UNBOOKED',
+      isDeleted: false,
+      shipperApprovalStatus: 'pending',
+    };
+
+    // For shipper portal, restrict to the authenticated shipper.
+    if (user.role === 'SHIPPER') {
+      const shipperIdNum = Number(user.id);
+      if (!shipperIdNum || !Number.isInteger(shipperIdNum)) {
+        return res.status(401).json({ message: 'Unauthorized' });
+      }
+      where.shipperId = shipperIdNum;
+    }
+
+    // CEO / MANAGER will see all pending integrated orders across shippers.
     const orders = await prisma.order.findMany({
-      where: {
-        shipperId,
-        isIntegrated: true,
-        bookingState: 'UNBOOKED',
-        isDeleted: false,
-        shipperApprovalStatus: 'pending',
-      },
+      where,
       orderBy: { createdAt: 'desc' },
+      include: {
+        shipper: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            companyName: true,
+            phone: true,
+          },
+        },
+      },
     });
 
     res.json(orders.map(mapOrderToApi));
