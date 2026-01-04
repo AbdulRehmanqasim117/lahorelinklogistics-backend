@@ -11,7 +11,7 @@
     "prisma:deploy": "node node_modules/prisma/build/index.js migrate deploy",
     "build": "node -e \"const fs=require('fs');['build','dist'].forEach(d=>{try{fs.mkdirSync(d,{recursive:true});}catch(e){}})\" && npm run prisma:generate",
     "seed": "node prisma/seed.js",
-    "postinstall": "npm run prisma:generate && npm run seed"
+    "postinstall": "npm run prisma:generate && npm run prisma:deploy && npm run seed"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
