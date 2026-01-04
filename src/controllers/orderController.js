@@ -717,10 +717,13 @@ const printLabelsHtml = async (req, res, next) => {
       const weightVal = o.weight || '0.5 KG';
       const fragileVal = o.fragile ? 'true' : 'false';
       const piecesVal = o.pieces || 1;
-      const remarksVal = o.remarks || (o.fragile ? 'FRAGILE - Handle with care' : 'Allow to open in front of rider');
+      const rawRemarks = (o.remarks || '').trim();
+      const remarksVal = rawRemarks || (o.fragile ? 'FRAGILE - Handle with care' : '');
       const products = o.productDescription || 'N/A';
-      const qrContent = `LLL|${o.bookingId || ''}`;
-      const qrDataUrl = await QRCode.toDataURL(qrContent, { margin: 0, width: 90 });
+      const warehouseQrContent = `LLL|${o.bookingId || ''}`;
+      const warehouseQrDataUrl = await QRCode.toDataURL(warehouseQrContent, { margin: 0, width: 90 });
+      const websiteUrl = process.env.APP_BASE_URL || 'https://lahorelinklogistics.com';
+      const websiteQrDataUrl = await QRCode.toDataURL(websiteUrl, { margin: 0, width: 90 });
       const logoUrl = `/logo.png`;
       return {
         html: `
@@ -739,6 +742,9 @@ const printLabelsHtml = async (req, res, next) => {
                 <div class=\"order-row\">
                   <span class=\"order-label\">Order: ${o.bookingId}</span>
                   <div class=\"barcode-container\">${orderBarcode}</div>
+                  <div class=\"order-qr\">
+                    <img src=\"${warehouseQrDataUrl}\" alt=\"QR ${warehouseQrContent}\" class=\"qr-img-small\" />
+                  </div>
                 </div>
               </div>
             </div>
@@ -764,8 +770,8 @@ const printLabelsHtml = async (req, res, next) => {
                   <img src=\"${logoUrl}\" alt=\"LahoreLink Logistics\" class=\"logo-img\" />
                 </div>
                 <div class=\"qr-box\">
-                  <img src=\"${qrDataUrl}\" alt=\"QR ${qrContent}\" class=\"qr-img\" />
-                  <div class=\"qr-caption\">Scan to mark<br/>arrived at LLL warehouse</div>
+                  <img src=\"${websiteQrDataUrl}\" alt=\"Website QR\" class=\"qr-img\" />
+                  <div class=\"qr-caption\">Track at<br/>lahorelinklogistics.com</div>
                 </div>
               </div>
               <div class=\"tracking-barcode-container\">
@@ -788,7 +794,7 @@ const printLabelsHtml = async (req, res, next) => {
         </div>
         <div class=\"remarks-section\">
           <span class=\"remarks-label\">Remarks:</span>
-          <span class=\"remarks-value\">- ${remarksVal}</span>
+          <span class=\"remarks-value\">${remarksVal ? '- ' + remarksVal : ''}</span>
         </div>
         <div class=\"products-section\">
           <span class=\"products-label\">Products:</span>
@@ -862,6 +868,7 @@ const printLabelsHtml = async (req, res, next) => {
     .divider { border-top: 1px solid #000; margin: 4px 0; }
     .destination { font-weight: bold; font-size: 10px; margin-top: 2px; }
     .order-row { margin-top: 4px; }
+    .order-qr { margin-top: 2px; display: flex; justify-content: center; }
     .order-label { font-weight: bold; }
     .barcode-container { 
       margin: 2px 0; 
@@ -891,6 +898,7 @@ const printLabelsHtml = async (req, res, next) => {
       .logo-img { height: 40px; width: auto; }
       .qr-box { display: flex; flex-direction: column; align-items: center; gap: 2px; }
       .qr-img { width: 70px; height: 70px; object-fit: contain; }
+    .qr-img-small { width: 50px; height: 50px; object-fit: contain; }
       .qr-caption { font-size: 7px; line-height: 1.1; text-align: center; }
     .tracking-barcode-container { 
       padding: 4px; 
