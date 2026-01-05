@@ -703,8 +703,7 @@ const printLabelsHtml = async (req, res, next) => {
 
     const labelsWithQr = await Promise.all(orders.map(async (o) => {
       const codAmount = Number(o.codAmount || 0);
-      const serviceCharges = Number(o.serviceCharges || 0);
-      const finalAmount = codAmount + serviceCharges;
+      const finalAmount = codAmount;
       const cod = Number(finalAmount || 0).toLocaleString();
       const created = new Date(o.createdAt).toISOString().split('T')[0];
       const trackingBarcode = barcodeSvg(String(o.trackingId || '').replace(/[^0-9]/g, ''));
