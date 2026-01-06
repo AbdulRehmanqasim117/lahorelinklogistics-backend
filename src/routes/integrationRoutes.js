@@ -67,5 +67,13 @@ router.post(
   shopifyIntegrationController.bookIntegratedOrder,
 );
 
+router.post(
+  '/shopify/orders/:integratedOrderId/unbook',
+  auth,
+  requireRole('SHIPPER'),
+  requireCommissionApproved,
+  shopifyIntegrationController.unbookIntegratedOrder,
+);
+
 module.exports = router;
 

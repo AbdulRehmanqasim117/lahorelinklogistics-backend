@@ -291,6 +291,94 @@ exports.bookIntegratedOrder = async (req, res, next) => {
   }
 };
 
+exports.unbookIntegratedOrder = async (req, res, next) => {
+  try {
+    const shipperIdRaw = req.user && (req.user._id || req.user.id);
+    const shipperId = Number(shipperIdRaw);
+    if (!Number.isInteger(shipperId) || shipperId <= 0)
+      return sendError(res, 401, 'Unauthorized');
+
+    const rawId = req.params.integratedOrderId;
+    const integratedOrderId = Number(rawId);
+    if (!Number.isInteger(integratedOrderId) || integratedOrderId <= 0) {
+      return sendError(res, 400, 'Invalid integratedOrderId');
+    }
+
+    const integrated = await prisma.integratedOrder.findFirst({
+      where: {
+        id: integratedOrderId,
+        shipperId,
+        provider: 'SHOPIFY',
+      },
+    });
+
+    if (!integrated) {
+      return sendError(res, 404, 'Integrated order not found');
+    }
+
+    if (integrated.lllBookingStatus !== 'BOOKED' || !integrated.lllOrderId) {
+      return sendError(res, 400, 'Integrated order is not booked with LLL');
+    }
+
+    const order = await prisma.order.findUnique({
+      where: { id: integrated.lllOrderId },
+    });
+
+    if (!order) {
+      const updatedIntegrated = await prisma.integratedOrder.update({
+        where: { id: integrated.id },
+        data: {
+          lllBookingStatus: 'NOT_BOOKED',
+          bookedAt: null,
+          bookedById: null,
+          lllOrderId: null,
+        },
+      });
+
+      return res.status(200).json({
+        message: 'Integrated order unbooked (LLL order already missing)',
+        integratedOrder: { ...updatedIntegrated, _id: updatedIntegrated.id },
+      });
+    }
+
+    if (order.shipperId !== shipperId) {
+      return sendError(res, 403, 'Not authorized to unbook this order');
+    }
+
+    if (order.status !== 'CREATED') {
+      return sendError(
+        res,
+        400,
+        'Cannot unbook an order that has already been processed',
+      );
+    }
+
+    const updatedIntegrated = await prisma.$transaction(async (tx) => {
+      const i = await tx.integratedOrder.update({
+        where: { id: integrated.id },
+        data: {
+          lllBookingStatus: 'NOT_BOOKED',
+          bookedAt: null,
+          bookedById: null,
+          lllOrderId: null,
+        },
+      });
+
+      await tx.order.delete({ where: { id: order.id } });
+
+      return i;
+    });
+
+    return res.status(200).json({
+      message: 'Integrated order unbooked',
+      integratedOrder: { ...updatedIntegrated, _id: updatedIntegrated.id },
+    });
+  } catch (err) {
+    console.error('[ShopifyIntegration] unbookIntegratedOrder error', err);
+    next(err);
+  }
+};
+
 exports.getConnectedStore = async (req, res, next) => {
   try {
     const shipperIdRaw = req.user && (req.user._id || req.user.id);
