@@ -16,6 +16,35 @@ const normalizePhone = (value) => {
   return String(value).replace(/\D/g, '');
 };
 
+const normalizeShopDomain = (value) => {
+  if (!value) return '';
+  let v = String(value).trim().toLowerCase();
+
+  v = v.replace(/^https?:\/\//, '');
+
+  const adminMatch = v.match(/admin\.shopify\.com\/store\/([^/?#]+)/);
+  if (adminMatch && adminMatch[1]) {
+    return `${adminMatch[1]}.myshopify.com`;
+  }
+
+  const hashIndex = v.indexOf('#');
+  if (hashIndex !== -1) {
+    v = v.slice(0, hashIndex);
+  }
+
+  const queryIndex = v.indexOf('?');
+  if (queryIndex !== -1) {
+    v = v.slice(0, queryIndex);
+  }
+
+  const slashIndex = v.indexOf('/');
+  if (slashIndex !== -1) {
+    v = v.slice(0, slashIndex);
+  }
+
+  return v;
+};
+
 exports.connectStore = async (req, res, next) => {
   try {
     const shipperIdRaw = req.user && (req.user._id || req.user.id);
@@ -30,7 +59,7 @@ exports.connectStore = async (req, res, next) => {
       return sendError(res, 400, 'shopDomain is required');
     }
 
-    shopDomain = String(shopDomain).trim().toLowerCase();
+    shopDomain = normalizeShopDomain(shopDomain);
 
     if (Array.isArray(scopes)) {
       scopes = scopes.map((s) => String(s || '').trim()).filter(Boolean);

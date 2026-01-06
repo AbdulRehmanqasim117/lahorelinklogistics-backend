@@ -1,6 +1,35 @@
 const crypto = require('crypto');
 const prisma = require('../prismaClient');
 
+const normalizeShopDomain = (value) => {
+  if (!value) return '';
+  let v = String(value).trim().toLowerCase();
+
+  v = v.replace(/^https?:\/\//, '');
+
+  const adminMatch = v.match(/admin\.shopify\.com\/store\/([^/?#]+)/);
+  if (adminMatch && adminMatch[1]) {
+    return `${adminMatch[1]}.myshopify.com`;
+  }
+
+  const hashIndex = v.indexOf('#');
+  if (hashIndex !== -1) {
+    v = v.slice(0, hashIndex);
+  }
+
+  const queryIndex = v.indexOf('?');
+  if (queryIndex !== -1) {
+    v = v.slice(0, queryIndex);
+  }
+
+  const slashIndex = v.indexOf('/');
+  if (slashIndex !== -1) {
+    v = v.slice(0, slashIndex);
+  }
+
+  return v;
+};
+
 const getWebhookSecret = () => {
   return (
     (process.env.SHOPIFY_WEBHOOK_SECRET || process.env.SHOPIFY_API_SECRET || '')
@@ -88,7 +117,9 @@ const mapShopifyToIntegratedOrder = (payload) => {
 exports.handleShopifyWebhook = async (req, res) => {
   try {
     const topic = req.header('X-Shopify-Topic') || '';
-    const shopDomain = (req.header('X-Shopify-Shop-Domain') || '').toLowerCase();
+    const shopDomain = normalizeShopDomain(
+      req.header('X-Shopify-Shop-Domain') || '',
+    );
     const hmacHeader = req.header('X-Shopify-Hmac-Sha256') || '';
     const webhookId = req.header('X-Shopify-Webhook-Id') || '';
     const webhookCreatedAtHeader = req.header('X-Shopify-Webhook-Created-At') || '';
