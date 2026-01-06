@@ -261,3 +261,31 @@ exports.bookIntegratedOrder = async (req, res, next) => {
     next(err);
   }
 };
+
+exports.getConnectedStore = async (req, res, next) => {
+  try {
+    const shipperIdRaw = req.user && (req.user._id || req.user.id);
+    const shipperId = Number(shipperIdRaw);
+    if (!Number.isInteger(shipperId) || shipperId <= 0)
+      return sendError(res, 401, 'Unauthorized');
+
+    const integrations = await prisma.shipperIntegration.findMany({
+      where: {
+        shipperId,
+        provider: 'SHOPIFY',
+        status: 'active',
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const primary = integrations[0] || null;
+
+    return res.json({
+      shopDomain: primary ? primary.shopDomain : '',
+      integration: primary,
+    });
+  } catch (err) {
+    console.error('[ShopifyIntegration] getConnectedStore error', err);
+    next(err);
+  }
+};

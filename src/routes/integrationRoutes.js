@@ -42,6 +42,14 @@ router.post(
   shopifyIntegrationController.connectStore,
 );
 
+router.get(
+  '/shopify/store',
+  auth,
+  requireRole('SHIPPER'),
+  requireCommissionApproved,
+  shopifyIntegrationController.getConnectedStore,
+);
+
 // Shopify integrated orders (JWT, shipper-facing)
 router.get(
   '/shopify/orders',
