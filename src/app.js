@@ -18,6 +18,14 @@ const ALLOWED_PROD_ORIGINS = [
   "https://www.lahorelinklogistics.com",
 ];
 
+// Allow local development frontends to call the production API without CORS
+// errors. This is safe because only a browser on the developer's machine can
+// send requests with these origins.
+const DEV_LOCALHOST_ORIGINS = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+];
+
 if (FRONTEND_URL && !ALLOWED_PROD_ORIGINS.includes(FRONTEND_URL)) {
   ALLOWED_PROD_ORIGINS.push(FRONTEND_URL);
 }
@@ -50,7 +58,10 @@ const corsOptions = {
           if (!origin) {
             return callback(null, true);
           }
-          if (ALLOWED_PROD_ORIGINS.includes(origin)) {
+          if (
+            ALLOWED_PROD_ORIGINS.includes(origin) ||
+            DEV_LOCALHOST_ORIGINS.includes(origin)
+          ) {
             return callback(null, true);
           }
           return callback(new Error("Not allowed by CORS"));
