@@ -521,6 +521,28 @@ const updateStatus = async (req, res, next) => {
       data.failedReason = reason;
     }
 
+    // Apply flat return service charge configured per shipper when order is RETURNED.
+    // This overrides any existing weight-based service charges for returned orders.
+    if (status === 'RETURNED') {
+      try {
+        const cfg = await prisma.commissionConfig.findUnique({
+          where: { shipperId: existing.shipperId },
+        });
+        if (cfg && typeof cfg.returnCharge === 'number') {
+          const rc = Number(cfg.returnCharge || 0);
+          if (!Number.isNaN(rc) && rc >= 0) {
+            data.serviceCharges = rc;
+          }
+        }
+      } catch (cfgErr) {
+        console.error(
+          'Error applying returnCharge for shipper',
+          existing.shipperId,
+          cfgErr,
+        );
+      }
+    }
+
     const updated = await prisma.order.update({
       where: { id: orderId },
       data: {

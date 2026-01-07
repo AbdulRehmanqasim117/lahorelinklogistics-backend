@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const CompanyProfileSchema = new mongoose.Schema({
   companyName: {
     type: String,
-    required: true,
+    required: true,//here
     default: 'LahoreLink Courier Services'
   },
   logoUrl: {

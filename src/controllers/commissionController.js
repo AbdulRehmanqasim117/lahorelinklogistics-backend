@@ -63,6 +63,7 @@ function mapCommissionConfigToApi(cfg, { includeShipperDetails = false } = {}) {
     value: cfg.value,
     riderType: cfg.riderType,
     riderValue: cfg.riderValue,
+    returnCharge: cfg.returnCharge ?? 0,
     weightBrackets: mapWeightBrackets(cfg.weightBrackets),
   };
 
@@ -143,7 +144,15 @@ exports.getConfigs = async (req, res, next) => {
 
 exports.upsertConfig = async (req, res, next) => {
   try {
-    const { shipperId, type, value, riderType, riderValue, weightCharges } = req.body;
+    const {
+      shipperId,
+      type,
+      value,
+      riderType,
+      riderValue,
+      weightCharges,
+      returnCharge,
+    } = req.body;
 
     if (!shipperId || !type || value === undefined) {
       return res.status(400).json({ message: 'Missing required fields' });
@@ -161,6 +170,10 @@ exports.upsertConfig = async (req, res, next) => {
 
     if (riderType !== undefined) mainData.riderType = riderType;
     if (riderValue !== undefined) mainData.riderValue = Number(riderValue);
+    if (returnCharge !== undefined) {
+      const rcNum = Number(returnCharge);
+      mainData.returnCharge = Number.isNaN(rcNum) ? 0 : rcNum;
+    }
 
     let updated;
 
@@ -351,6 +364,13 @@ exports.getConfigByShipper = async (req, res, next) => {
         .json({ message: 'No commission config found for this shipper' });
     }
 
+    console.log(
+      '[Commission] GET config for shipper',
+      shipperId,
+      'returnCharge =',
+      cfg.returnCharge,
+    );
+
     res.json(mapCommissionConfigToApi(cfg));
   } catch (err) {
     next(err);
@@ -370,7 +390,7 @@ exports.putConfigByShipper = async (req, res, next) => {
       return res.status(400).json({ message: 'Invalid shipperId' });
     }
 
-    const { type, value, weightBrackets } = req.body;
+    const { type, value, weightBrackets, returnCharge } = req.body;
     if (!type || typeof value !== 'number') {
       return res.status(400).json({ message: 'type and value required' });
     }
@@ -393,6 +413,13 @@ exports.putConfigByShipper = async (req, res, next) => {
 
     let result;
 
+    console.log(
+      '[Commission] PUT body for shipper',
+      shipperId,
+      'payload.returnCharge =',
+      returnCharge,
+    );
+
     await prisma.$transaction(async (tx) => {
       let existing = await tx.commissionConfig.findUnique({
         where: { shipperId },
@@ -404,6 +431,12 @@ exports.putConfigByShipper = async (req, res, next) => {
             shipperId,
             type,
             value,
+            returnCharge:
+              returnCharge === undefined || returnCharge === null
+                ? 0
+                : Number.isNaN(Number(returnCharge))
+                  ? 0
+                  : Number(returnCharge),
             weightBrackets: {
               create: normalizedBrackets.map((b) => ({
                 minKg: b.minKg,
@@ -430,13 +463,26 @@ exports.putConfigByShipper = async (req, res, next) => {
           });
         }
 
+        const updateData = { type, value };
+        if (returnCharge !== undefined) {
+          const rcNum = Number(returnCharge);
+          updateData.returnCharge = Number.isNaN(rcNum) ? 0 : rcNum;
+        }
+
         result = await tx.commissionConfig.update({
           where: { id: existing.id },
-          data: { type, value },
+          data: updateData,
           include: { weightBrackets: true },
         });
       }
     });
+
+    console.log(
+      '[Commission] PUT saved for shipper',
+      shipperId,
+      'stored returnCharge =',
+      result.returnCharge,
+    );
 
     res.json(mapCommissionConfigToApi(result));
   } catch (err) {
