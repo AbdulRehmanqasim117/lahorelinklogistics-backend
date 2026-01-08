@@ -615,9 +615,17 @@ const getLabel = async (req, res, next) => {
       return res.status(403).json({ message: 'Forbidden' });
     }
 
+    const externalOrderNumber =
+      order.sourceProviderOrderNumber || order.externalOrderId || null;
+    const isIntegrated = !!order.isIntegrated;
+    const displayOrderNumber = externalOrderNumber || order.bookingId;
+
     const labelData = {
       bookingId: order.bookingId,
       trackingId: order.trackingId,
+      isIntegrated,
+      shopifyOrderNumber: externalOrderNumber,
+      displayOrderNumber,
       consignee: {
         name: order.consigneeName,
         phone: order.consigneePhone,
@@ -637,6 +645,8 @@ const getLabel = async (req, res, next) => {
         pieces: order.pieces,
         fragile: order.fragile,
         createdAt: order.createdAt,
+        isIntegrated,
+        shopifyOrderNumber: externalOrderNumber,
       },
     };
 
@@ -676,30 +686,42 @@ const getLabels = async (req, res, next) => {
       return true;
     });
 
-    const labels = permitted.map((order) => ({
-      bookingId: order.bookingId,
-      trackingId: order.trackingId,
-      consignee: {
-        name: order.consigneeName,
-        phone: order.consigneePhone,
-        address: order.consigneeAddress,
-        destinationCity: order.destinationCity,
-      },
-      shipper: {
-        name: order.shipper?.name || 'N/A',
-        companyName: order.shipper?.companyName || 'N/A',
-        serviceType: order.serviceType,
-      },
-      order: {
-        codAmount: order.codAmount,
-        serviceCharges: order.serviceCharges || 0,
-        paymentType: order.paymentType,
-        productDescription: order.productDescription,
-        pieces: order.pieces,
-        fragile: order.fragile,
-        createdAt: order.createdAt,
-      },
-    }));
+    const labels = permitted.map((order) => {
+      const externalOrderNumber =
+        order.sourceProviderOrderNumber || order.externalOrderId || null;
+      const isIntegrated = !!order.isIntegrated;
+      const displayOrderNumber = externalOrderNumber || order.bookingId;
+
+      return {
+        bookingId: order.bookingId,
+        trackingId: order.trackingId,
+        isIntegrated,
+        shopifyOrderNumber: externalOrderNumber,
+        displayOrderNumber,
+        consignee: {
+          name: order.consigneeName,
+          phone: order.consigneePhone,
+          address: order.consigneeAddress,
+          destinationCity: order.destinationCity,
+        },
+        shipper: {
+          name: order.shipper?.name || 'N/A',
+          companyName: order.shipper?.companyName || 'N/A',
+          serviceType: order.serviceType,
+        },
+        order: {
+          codAmount: order.codAmount,
+          serviceCharges: order.serviceCharges || 0,
+          paymentType: order.paymentType,
+          productDescription: order.productDescription,
+          pieces: order.pieces,
+          fragile: order.fragile,
+          createdAt: order.createdAt,
+          isIntegrated,
+          shopifyOrderNumber: externalOrderNumber,
+        },
+      };
+    });
 
     res.json({ count: labels.length, labels });
   } catch (error) {
@@ -735,12 +757,16 @@ const printLabelsHtml = async (req, res, next) => {
     };
 
     const labelsWithQr = await Promise.all(orders.map(async (o) => {
+      const externalOrderNumber =
+        o.sourceProviderOrderNumber || o.externalOrderId || null;
+      const isIntegrated = !!o.isIntegrated;
+      const displayOrderNumber = externalOrderNumber || o.bookingId;
       const codAmount = Number(o.codAmount || 0);
       const finalAmount = codAmount;
       const cod = Number(finalAmount || 0).toLocaleString();
       const created = new Date(o.createdAt).toISOString().split('T')[0];
       const trackingBarcode = barcodeSvg(String(o.trackingId || '').replace(/[^0-9]/g, ''));
-      const orderBarcode = barcodeSvg(String(o.bookingId || '').replace(/[^0-9]/g, ''));
+      const orderBarcode = barcodeSvg(String(displayOrderNumber || '').replace(/[^0-9]/g, ''));
       const codBarcode = barcodeSvg(String(finalAmount).replace(/[^0-9]/g, ''));
       const shipperName = o.shipper?.name || 'N/A';
       const shipperAddress = o.shipper?.address || o.shipper?.companyName || 'N/A';
@@ -772,7 +798,7 @@ const printLabelsHtml = async (req, res, next) => {
                 <div class=\"destination\">Destination: ${o.destinationCity}</div>
                 <div class=\"divider\"></div>
                 <div class=\"order-row\">
-                  <span class=\"order-label\">Order: ${o.bookingId}</span>
+                  <span class=\"order-label\">Order: ${displayOrderNumber}</span>
                   <div class=\"barcode-container\">${orderBarcode}</div>
                   <div class=\"order-qr\">
                     <img src=\"${warehouseQrDataUrl}\" alt=\"QR ${warehouseQrContent}\" class=\"qr-img-small\" />

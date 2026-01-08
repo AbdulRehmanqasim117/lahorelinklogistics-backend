@@ -2,7 +2,6 @@ const express = require("express");
 const cors = require("cors");
 const connectDB = require("./config/db");
 const errorHandler = require("./middleware/errorHandler");
-const bcrypt = require("bcryptjs");
 const path = require("path");
 const webhookRoutes = require("./routes/webhookRoutes");
 const prisma = require("./prismaClient");
@@ -28,20 +27,6 @@ const DEV_LOCALHOST_ORIGINS = [
 
 if (FRONTEND_URL && !ALLOWED_PROD_ORIGINS.includes(FRONTEND_URL)) {
   ALLOWED_PROD_ORIGINS.push(FRONTEND_URL);
-}
-
-const CEO_EMAIL = (process.env.CEO_EMAIL || "").trim();
-const CEO_PASSWORD = (process.env.CEO_PASSWORD || "").trim();
-const MANAGER_EMAIL = (process.env.MANAGER_EMAIL || "").trim();
-const MANAGER_PASSWORD = (process.env.MANAGER_PASSWORD || "").trim();
-
-const HAS_ADMIN_SEED_ENVS =
-  !!CEO_EMAIL && !!CEO_PASSWORD && !!MANAGER_EMAIL && !!MANAGER_PASSWORD;
-
-if (!HAS_ADMIN_SEED_ENVS) {
-  console.warn(
-    "CEO or Manager credentials missing in environment variables; admin accounts will not be auto-seeded",
-  );
 }
 
 // Connect to database (Prisma/MySQL only)
@@ -103,6 +88,7 @@ app.use("/api/dashboard", require("./routes/dashboardRoutes"));
 app.use("/api/riders", require("./routes/riderRoutes"));
 app.use("/api/notifications", require("./routes/notificationRoutes"));
 app.use("/api/company-profile", require("./routes/companyProfileRoutes"));
+app.use("/api/setup", require("./routes/setupRoutes"));
 
 app.get("/health", async (req, res) => {
   try {
@@ -116,96 +102,5 @@ app.get("/health", async (req, res) => {
 
 // Error Handler
 app.use(errorHandler);
-
-// Seed CEO and Manager accounts only after DB connects (Prisma-based)
-const seedAccounts = async () => {
-  try {
-    // CEO
-    let ceo = await prisma.user.findFirst({ where: { role: "CEO" } });
-    if (!ceo) {
-      const hash = await bcrypt.hash(CEO_PASSWORD, 10);
-      await prisma.user.create({
-        data: {
-          name: "CEO",
-          email: CEO_EMAIL,
-          passwordHash: hash,
-          role: "CEO",
-          status: "ACTIVE",
-        },
-      });
-      console.log("Seeded CEO account");
-    } else {
-      const updates = {};
-      if (ceo.email !== CEO_EMAIL) {
-        updates.email = CEO_EMAIL;
-      }
-      const ceoPasswordOk = await bcrypt.compare(CEO_PASSWORD, ceo.passwordHash || "");
-      if (!ceoPasswordOk) {
-        updates.passwordHash = await bcrypt.hash(CEO_PASSWORD, 10);
-      }
-      if (Object.keys(updates).length > 0) {
-        await prisma.user.update({ where: { id: ceo.id }, data: updates });
-      }
-    }
-
-    // Manager
-    let manager = await prisma.user.findFirst({ where: { role: "MANAGER" } });
-    if (!manager) {
-      const hash = await bcrypt.hash(MANAGER_PASSWORD, 10);
-      await prisma.user.create({
-        data: {
-          name: "Manager",
-          email: MANAGER_EMAIL,
-          passwordHash: hash,
-          role: "MANAGER",
-          status: "ACTIVE",
-        },
-      });
-      console.log("Seeded Manager account");
-    } else {
-      const updates = {};
-      if (manager.email !== MANAGER_EMAIL) {
-        updates.email = MANAGER_EMAIL;
-      }
-      const managerPasswordOk = await bcrypt.compare(
-        MANAGER_PASSWORD,
-        manager.passwordHash || ""
-      );
-      if (!managerPasswordOk) {
-        updates.passwordHash = await bcrypt.hash(MANAGER_PASSWORD, 10);
-      }
-      if (Object.keys(updates).length > 0) {
-        await prisma.user.update({ where: { id: manager.id }, data: updates });
-      }
-    }
-  } catch (err) {
-    console.error("Seeding error", err.message);
-  }
-};
-
-let seeded = false;
-const trySeed = async () => {
-  if (seeded) return;
-  try {
-    await seedAccounts();
-    seeded = true;
-  } catch (e) {
-    // logged inside seedAccounts
-  }
-};
-
-dbReady.then((ok) => {
-  if (!ok) {
-    console.warn("Skipping seed: DB not connected");
-    return;
-  }
-
-  if (!HAS_ADMIN_SEED_ENVS) {
-    console.warn("Skipping seed: admin env vars are not fully configured");
-    return;
-  }
-
-  trySeed();
-});
 
 module.exports = app;
