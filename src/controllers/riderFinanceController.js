@@ -143,9 +143,16 @@ exports.getMyFinance = async (req, res, next) => {
           : Number(o?.codAmount ?? 0);
       const settlementStatus = String(tx.settlementStatus || '').toUpperCase();
 
+      const externalOrderNo =
+        (o && (o.sourceProviderOrderNumber || o.externalOrderId)) ||
+        (o && o.bookingId) ||
+        '';
+
       return {
         id: o?.id || tx.id,
-        orderId: o?.bookingId || '',
+        // For integrated orders, surface Shopify/external order number
+        // instead of internal bookingId wherever we show "Order ID".
+        orderId: externalOrderNo,
         date: o?.deliveredAt || o?.updatedAt || o?.createdAt || tx.createdAt,
         shipperName: o?.shipper?.companyName || o?.shipper?.name || '',
         destination: o?.destinationCity || '',
@@ -249,9 +256,12 @@ exports.getRiderSettlementsAdmin = async (req, res, next) => {
 
     if (search && String(search).trim()) {
       const q = String(search).trim();
+      // Allow admin rider settlements search by booking, tracking, or
+      // external provider order number (e.g. Shopify order number).
       where.OR = [
         { bookingId: { contains: q, mode: 'insensitive' } },
         { trackingId: { contains: q, mode: 'insensitive' } },
+        { sourceProviderOrderNumber: { contains: q, mode: 'insensitive' } },
       ];
     }
 
@@ -352,9 +362,14 @@ exports.getRiderSettlementsAdmin = async (req, res, next) => {
         summary.riderEarningsUnpaid += riderEarning;
       }
 
+      const externalOrderNo =
+        o.sourceProviderOrderNumber || o.externalOrderId || o.bookingId;
+
       return {
         id: o.id,
-        orderId: o.bookingId,
+        // Show Shopify/external order number for integrated orders in
+        // all rider settlement views.
+        orderId: externalOrderNo,
         date,
         shipperName: o.shipper?.companyName || o.shipper?.name || '',
         consigneeName: o.consigneeName,

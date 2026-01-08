@@ -16,6 +16,13 @@ function mapOrderToApi(order) {
     _id: o.id,
   };
 
+  // Surface Shopify order number explicitly for integrated orders so
+  // frontends don't have to know about internal column naming.
+  // Fallback to externalOrderId for generic integrations that don't
+  // populate sourceProviderOrderNumber.
+  base.shopifyOrderNumber =
+    o.sourceProviderOrderNumber || o.externalOrderId || null;
+
   if (shipper) {
     base.shipper = {
       _id: shipper.id,
@@ -184,10 +191,13 @@ const getOrders = async (req, res, next) => {
 
     if (q && q.trim()) {
       const searchId = q.trim();
-      // For search, override visibility logic like the legacy Mongo query did
+      // For search, override visibility logic like the legacy Mongo query did.
+      // Allow lookup by Tracking ID (primary), Booking ID, or external
+      // provider order number (e.g. Shopify order number).
       where.OR = [
-        { bookingId: searchId },
         { trackingId: searchId },
+        { bookingId: searchId },
+        { sourceProviderOrderNumber: searchId },
       ];
     }
 
