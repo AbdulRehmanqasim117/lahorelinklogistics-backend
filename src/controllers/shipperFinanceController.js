@@ -172,14 +172,19 @@ exports.getMyFinanceLedger = async (req, res, next) => {
 
     const rows = orders.map((o) => {
       const isDelivered = o.status === 'DELIVERED';
-      const codForDelivered =
-        isDelivered && o.paymentType === 'COD'
-          ? Number(o.amountCollected ?? o.codAmount ?? 0)
-          : 0;
-      const codAmount =
-        isDelivered && o.paymentType === 'COD'
-          ? codForDelivered
-          : Number(o.codAmount ?? 0);
+      const isReturnedOrFailed = o.status === 'RETURNED' || o.status === 'FAILED';
+
+      // Shipper ledger policy:
+      // - DELIVERED + COD: COD = collected COD (or codAmount), receivable = COD - serviceCharges
+      // - RETURNED/FAILED and all non-delivered: COD is not due to shipper, show 0
+      //   and receivable is just negative service charges (payable by shipper).
+
+      let codAmount = 0;
+      if (isDelivered && o.paymentType === 'COD') {
+        codAmount = Number(o.amountCollected ?? o.codAmount ?? 0);
+      } else {
+        codAmount = 0;
+      }
 
       const serviceCharges = Number(o.serviceCharges || 0);
       const receivable = codAmount - serviceCharges;

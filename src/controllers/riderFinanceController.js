@@ -95,10 +95,15 @@ exports.getMyFinance = async (req, res, next) => {
     const items = orders.map((o) => {
       const tx = o.financialTransaction;
 
-      const codAmount =
-        o.status === 'DELIVERED'
-          ? Number(o.amountCollected ?? o.codAmount ?? 0)
-          : Number(o.codAmount ?? 0);
+      const isDelivered = o.status === 'DELIVERED';
+      const isCod = o.paymentType === 'COD';
+
+      let codAmount = 0;
+      if (isDelivered && isCod) {
+        codAmount = Number(o.amountCollected ?? o.codAmount ?? 0);
+      } else {
+        codAmount = 0;
+      }
 
       let riderEarning = Number(tx?.riderCommission || 0);
       if (!Number.isFinite(riderEarning) || riderEarning < 0) {
@@ -119,7 +124,7 @@ exports.getMyFinance = async (req, res, next) => {
         summary.failedCount += 1;
       }
 
-      if (o.status === 'DELIVERED' && o.paymentType === 'COD') {
+      if (isDelivered && isCod && codAmount > 0) {
         summary.codCollected += codAmount;
       }
 
