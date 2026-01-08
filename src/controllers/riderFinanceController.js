@@ -32,46 +32,51 @@ exports.getMyFinance = async (req, res, next) => {
       statusFilter = { in: allowedFinalStatuses };
     }
 
-    const createdAtFilter = {};
-    if (from) {
-      const d = new Date(from);
-      d.setHours(0, 0, 0, 0);
-      if (!Number.isNaN(d.getTime())) createdAtFilter.gte = d;
-    }
-    if (to) {
-      const d = new Date(to);
-      d.setHours(23, 59, 59, 999);
-      if (!Number.isNaN(d.getTime())) createdAtFilter.lte = d;
-    }
-
-    const orderWhere = {
-      status: statusFilter,
-      isDeleted: false,
+    const where = {
       assignedRiderId: riderId,
-      ...(Object.keys(createdAtFilter).length ? { createdAt: createdAtFilter } : {}),
+      isDeleted: false,
+      status: statusFilter,
     };
+
+    if (from || to) {
+      const createdAt = {};
+      if (from) {
+        const d = new Date(from);
+        d.setHours(0, 0, 0, 0);
+        if (!Number.isNaN(d.getTime())) createdAt.gte = d;
+      }
+      if (to) {
+        const d = new Date(to);
+        d.setHours(23, 59, 59, 999);
+        if (!Number.isNaN(d.getTime())) createdAt.lte = d;
+      }
+      if (Object.keys(createdAt).length) {
+        where.createdAt = createdAt;
+      }
+    }
 
     const pageNum = Math.max(1, Number(page) || 1);
     const limitNum = Math.min(100, Math.max(1, Number(limit) || 20));
     const orderDir = sortOrder === 'asc' ? 'asc' : 'desc';
 
-    // Summary over all matching transactions/orders
-    const [allTxs, unpaidBalanceRow] = await Promise.all([
-      prisma.financialTransaction.findMany({
-        where: {
-          riderId,
-          order: orderWhere,
-        },
-        include: {
-          order: true,
-        },
-      }),
+    const [unpaidBalanceRow, total, orders] = await Promise.all([
       prisma.financialTransaction.aggregate({
         _sum: { riderCommission: true },
         where: {
           riderId,
           settlementStatus: { in: ['UNPAID', 'PENDING'] },
         },
+      }),
+      prisma.order.count({ where }),
+      prisma.order.findMany({
+        where,
+        include: {
+          shipper: { select: { companyName: true, name: true } },
+          financialTransaction: true,
+        },
+        orderBy: { createdAt: orderDir },
+        skip: (pageNum - 1) * limitNum,
+        take: limitNum,
       }),
     ]);
 
@@ -87,84 +92,69 @@ exports.getMyFinance = async (req, res, next) => {
       unpaidBalance: 0,
     };
 
-    for (const tx of allTxs) {
-      const o = tx.order;
-      if (!o) continue;
+    const items = orders.map((o) => {
+      const tx = o.financialTransaction;
 
-      if (o.status === 'DELIVERED') summary.deliveredCount += 1;
-      else if (o.status === 'RETURNED') summary.returnedCount += 1;
-      else if (o.status === 'FAILED') summary.failedCount += 1;
+      const codAmount =
+        o.status === 'DELIVERED'
+          ? Number(o.amountCollected ?? o.codAmount ?? 0)
+          : Number(o.codAmount ?? 0);
+
+      let riderEarning = Number(tx?.riderCommission || 0);
+      if (!Number.isFinite(riderEarning) || riderEarning < 0) {
+        riderEarning = 0;
+      }
+
+      const normalizedTxStatus = String(tx?.settlementStatus || '').toUpperCase();
+      const settlementStatus =
+        normalizedTxStatus === 'PAID' || normalizedTxStatus === 'SETTLED'
+          ? 'PAID'
+          : 'UNPAID';
+
+      if (o.status === 'DELIVERED') {
+        summary.deliveredCount += 1;
+      } else if (o.status === 'RETURNED') {
+        summary.returnedCount += 1;
+      } else if (o.status === 'FAILED') {
+        summary.failedCount += 1;
+      }
 
       if (o.status === 'DELIVERED' && o.paymentType === 'COD') {
-        const codAmt = o.amountCollected != null ? o.amountCollected : o.codAmount || 0;
-        summary.codCollected += codAmt;
+        summary.codCollected += codAmount;
       }
 
-      summary.serviceChargesTotal += o.serviceCharges || 0;
-      summary.riderEarnings += tx.riderCommission || 0;
-
-      const st = String(tx.settlementStatus || '').toUpperCase();
-      if (['PAID', 'SETTLED'].includes(st)) {
-        summary.riderEarningsPaid += tx.riderCommission || 0;
+      summary.serviceChargesTotal += Number(o.serviceCharges || 0);
+      summary.riderEarnings += riderEarning;
+      if (settlementStatus === 'PAID') {
+        summary.riderEarningsPaid += riderEarning;
       } else {
-        summary.riderEarningsUnpaid += tx.riderCommission || 0;
+        summary.riderEarningsUnpaid += riderEarning;
       }
-    }
+
+      const externalOrderNo =
+        o.sourceProviderOrderNumber || o.externalOrderId || o.bookingId;
+
+      return {
+        id: o.id,
+        // For integrated orders, surface Shopify/external order number
+        // instead of internal bookingId wherever we show "Order ID".
+        orderId: externalOrderNo,
+        date: o.deliveredAt || o.updatedAt || o.createdAt,
+        shipperName: o.shipper?.companyName || o.shipper?.name || '',
+        destination: o.destinationCity || '',
+        codAmount,
+        serviceCharges: Number(o.serviceCharges || 0),
+        riderEarning,
+        status: o.status,
+        settlementStatus,
+        riderSettlementAt: tx?.paidAt || null,
+        riderSettlementBy: tx?.paidById || null,
+      };
+    });
 
     summary.unpaidBalance = Number(
       unpaidBalanceRow?._sum?.riderCommission || summary.riderEarningsUnpaid,
     );
-
-    // Paginated list of transactions with joined orders
-    const [total, txPage] = await Promise.all([
-      prisma.financialTransaction.count({
-        where: { riderId, order: orderWhere },
-      }),
-      prisma.financialTransaction.findMany({
-        where: { riderId, order: orderWhere },
-        include: {
-          order: {
-            include: {
-              shipper: { select: { companyName: true, name: true } },
-            },
-          },
-        },
-        orderBy: { createdAt: orderDir },
-        skip: (pageNum - 1) * limitNum,
-        take: limitNum,
-      }),
-    ]);
-
-    const items = txPage.map((tx) => {
-      const o = tx.order;
-      const codAmount =
-        o?.status === 'DELIVERED'
-          ? Number(o.amountCollected ?? o.codAmount ?? 0)
-          : Number(o?.codAmount ?? 0);
-      const settlementStatus = String(tx.settlementStatus || '').toUpperCase();
-
-      const externalOrderNo =
-        (o && (o.sourceProviderOrderNumber || o.externalOrderId)) ||
-        (o && o.bookingId) ||
-        '';
-
-      return {
-        id: o?.id || tx.id,
-        // For integrated orders, surface Shopify/external order number
-        // instead of internal bookingId wherever we show "Order ID".
-        orderId: externalOrderNo,
-        date: o?.deliveredAt || o?.updatedAt || o?.createdAt || tx.createdAt,
-        shipperName: o?.shipper?.companyName || o?.shipper?.name || '',
-        destination: o?.destinationCity || '',
-        codAmount,
-        serviceCharges: Number(o?.serviceCharges || 0),
-        riderEarning: Number(tx.riderCommission || 0),
-        status: o?.status || null,
-        settlementStatus,
-        riderSettlementAt: tx.paidAt || null,
-        riderSettlementBy: tx.paidById || null,
-      };
-    });
 
     res.json({
       summary: {
