@@ -1,5 +1,8 @@
 const ExcelJS = require("exceljs");
 const prisma = require("../prismaClient");
+const {
+  calculateServiceCharges: calculateServiceChargesForOrder,
+} = require("../utils/serviceChargeCalculator");
 
 // Basic date parsing helper that understands HTML date inputs (YYYY-MM-DD)
 // and falls back to native Date parsing. Returns null if invalid.
@@ -19,7 +22,9 @@ const parseDateInput = (raw) => {
   return Number.isNaN(dt.getTime()) ? null : dt;
 };
 
-// Helper function to calculate service charges if missing
+// Helper function to calculate service charges if missing, delegating to the
+// centralized Prisma-based calculator that already uses the new single-rule
+// commission config logic (with legacy WeightBracket fallback).
 const calculateServiceCharges = async (order) => {
   const existing = Number(order.serviceCharges || 0);
   if (existing > 0) {
@@ -27,38 +32,8 @@ const calculateServiceCharges = async (order) => {
   }
 
   try {
-    const shipperId =
-      order.shipperId || order.shipper?.id || order.shipper?.shipperId || null;
-    const weightKg = Number(order.weightKg || 0);
-
-    if (!shipperId || !weightKg) {
-      return 0;
-    }
-
-    const cfg = await prisma.commissionConfig.findUnique({
-      where: { shipperId: Number(shipperId) },
-      include: { weightBrackets: true },
-    });
-
-    if (!cfg || !Array.isArray(cfg.weightBrackets) || cfg.weightBrackets.length === 0) {
-      return 0;
-    }
-
-    const bracketsSorted = cfg.weightBrackets
-      .slice()
-      .sort((a, b) => Number(a.minKg || 0) - Number(b.minKg || 0));
-
-    const matching = bracketsSorted.find((b) => {
-      const min = Number(b.minKg || 0);
-      const max = b.maxKg === null || typeof b.maxKg === "undefined"
-        ? null
-        : Number(b.maxKg);
-      const withinMin = weightKg >= min;
-      const withinMax = max === null ? true : weightKg < max;
-      return withinMin && withinMax;
-    });
-
-    return matching ? Number(matching.chargePkr || 0) : 0;
+    const { serviceCharges } = await calculateServiceChargesForOrder(order);
+    return Number(serviceCharges || 0);
   } catch (error) {
     console.error("Error calculating service charges:", error);
     return 0;

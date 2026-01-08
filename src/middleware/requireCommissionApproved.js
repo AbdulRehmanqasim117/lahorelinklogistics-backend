@@ -1,4 +1,5 @@
 const prisma = require('../prismaClient');
+const { normalizeCommissionRule } = require('../utils/serviceChargeCalculator');
 
 module.exports = async function requireCommissionApproved(req, res, next) {
   try {
@@ -17,17 +18,16 @@ module.exports = async function requireCommissionApproved(req, res, next) {
       include: { weightBrackets: true },
     });
 
-    const hasWeightBrackets =
-      cfg && Array.isArray(cfg.weightBrackets) && cfg.weightBrackets.length > 0;
+    const hasRule = !!normalizeCommissionRule(cfg || null);
 
-    if (hasWeightBrackets) {
+    if (hasRule) {
       return next();
     }
 
     return res.status(403).json({
       code: 'PORTAL_INACTIVE',
       message:
-        'Your account is under configuration. Please wait for management to set your weight brackets.',
+        'Your account is under configuration. Please wait for management to set your commission rule.',
     });
   } catch (error) {
     next(error);

@@ -1,4 +1,5 @@
 const prisma = require('../prismaClient');
+const { normalizeCommissionRule } = require('../utils/serviceChargeCalculator');
 
 module.exports = async function integrationAuth(req, res, next) {
   try {
@@ -61,20 +62,17 @@ module.exports = async function integrationAuth(req, res, next) {
       include: { weightBrackets: true },
     });
 
-    const hasWeightBrackets =
-      commissionCfg &&
-      Array.isArray(commissionCfg.weightBrackets) &&
-      commissionCfg.weightBrackets.length > 0;
+    const hasRule = !!normalizeCommissionRule(commissionCfg || null);
 
-    if (!hasWeightBrackets) {
+    if (!hasRule) {
       console.log(
-        '[integrationAuth] Shipper portal inactive (weight brackets not configured), blocking integration order creation:',
+        '[integrationAuth] Shipper portal inactive (commission rule not configured), blocking integration order creation:',
         config.shipperId,
       );
       return res.status(403).json({
         code: 'PORTAL_INACTIVE',
         message:
-          'Your account is under configuration. Please wait for management to set your weight brackets.',
+          'Your account is under configuration. Please wait for management to set your commission rule.',
       });
     }
 

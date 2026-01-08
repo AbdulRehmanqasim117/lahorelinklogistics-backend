@@ -1,4 +1,5 @@
 const prisma = require('../prismaClient');
+const { normalizeCommissionRule } = require('../utils/serviceChargeCalculator');
 
 function validateWeightBrackets(brackets) {
   if (!Array.isArray(brackets) || brackets.length === 0) {
@@ -55,6 +56,10 @@ function mapWeightBrackets(weightBrackets) {
 
 function mapCommissionConfigToApi(cfg, { includeShipperDetails = false } = {}) {
   if (!cfg) return null;
+
+  const rule = normalizeCommissionRule(cfg);
+  const weightBrackets = mapWeightBrackets(cfg.weightBrackets);
+
   const base = {
     _id: cfg.id,
     id: cfg.id,
@@ -64,8 +69,27 @@ function mapCommissionConfigToApi(cfg, { includeShipperDetails = false } = {}) {
     riderType: cfg.riderType,
     riderValue: cfg.riderValue,
     returnCharge: cfg.returnCharge ?? 0,
-    weightBrackets: mapWeightBrackets(cfg.weightBrackets),
+    // Expose raw single-rule fields from DB
+    minWeightKg: cfg.minWeightKg,
+    maxWeightKg: cfg.maxWeightKg,
+    flatChargePkr: cfg.flatChargePkr,
+    overagePerKgPkr: cfg.overagePerKgPkr,
+    hasCommissionRule: !!rule,
+    // Keep legacy brackets mapping for backwards compatibility
+    weightBrackets,
   };
+
+  // If there are no stored brackets but we have a normalized rule, synthesize a
+  // single "equivalent" bracket for UIs that still expect an array.
+  if (!base.weightBrackets.length && rule) {
+    base.weightBrackets = [
+      {
+        minKg: rule.minWeightKg,
+        maxKg: rule.maxWeightKg === undefined ? null : rule.maxWeightKg,
+        charge: rule.flatChargePkr,
+      },
+    ];
+  }
 
   if (includeShipperDetails && cfg.shipper) {
     base.shipper = {
@@ -152,6 +176,10 @@ exports.upsertConfig = async (req, res, next) => {
       riderValue,
       weightCharges,
       returnCharge,
+      minWeightKg,
+      maxWeightKg,
+      flatChargePkr,
+      overagePerKgPkr,
     } = req.body;
 
     if (!shipperId || !type || value === undefined) {
@@ -173,6 +201,54 @@ exports.upsertConfig = async (req, res, next) => {
     if (returnCharge !== undefined) {
       const rcNum = Number(returnCharge);
       mainData.returnCharge = Number.isNaN(rcNum) ? 0 : rcNum;
+    }
+
+    // Optional: accept new single-rule fields when provided. This path is
+    // additive and does not break legacy callers that only send weightCharges.
+    const hasMin =
+      minWeightKg !== undefined && minWeightKg !== null && minWeightKg !== '';
+    const hasMax =
+      maxWeightKg !== undefined && maxWeightKg !== null && maxWeightKg !== '';
+    const hasFlat =
+      flatChargePkr !== undefined &&
+      flatChargePkr !== null &&
+      flatChargePkr !== '';
+    const hasOver =
+      overagePerKgPkr !== undefined &&
+      overagePerKgPkr !== null &&
+      overagePerKgPkr !== '';
+
+    if (hasMin || hasMax || hasFlat || hasOver) {
+      const min = hasMin ? Number(minWeightKg) : 0;
+      const max = hasMax ? Number(maxWeightKg) : null;
+      const flat = hasFlat ? Number(flatChargePkr) : 0;
+      const over = hasOver ? Number(overagePerKgPkr) : 0;
+
+      if (!Number.isFinite(min) || min < 0) {
+        return res
+          .status(400)
+          .json({ message: 'minWeightKg must be a non-negative number' });
+      }
+      if (max !== null && (!Number.isFinite(max) || max <= min)) {
+        return res
+          .status(400)
+          .json({ message: 'maxWeightKg must be greater than minWeightKg' });
+      }
+      if (!Number.isFinite(flat) || flat < 0) {
+        return res
+          .status(400)
+          .json({ message: 'flatChargePkr must be a non-negative number' });
+      }
+      if (!Number.isFinite(over) || over < 0) {
+        return res
+          .status(400)
+          .json({ message: 'overagePerKgPkr must be a non-negative number' });
+      }
+
+      mainData.minWeightKg = min;
+      mainData.maxWeightKg = max;
+      mainData.flatChargePkr = Math.trunc(flat);
+      mainData.overagePerKgPkr = Math.trunc(over);
     }
 
     let updated;
@@ -390,26 +466,74 @@ exports.putConfigByShipper = async (req, res, next) => {
       return res.status(400).json({ message: 'Invalid shipperId' });
     }
 
-    const { type, value, weightBrackets, returnCharge } = req.body;
-    if (!type || typeof value !== 'number') {
+    const {
+      type,
+      value,
+      minWeightKg,
+      maxWeightKg,
+      flatChargePkr,
+      overagePerKgPkr,
+      returnCharge,
+    } = req.body;
+
+    if (!type || value === undefined || value === null || Number.isNaN(Number(value))) {
       return res.status(400).json({ message: 'type and value required' });
     }
 
-    const valRes = validateWeightBrackets(weightBrackets || []);
-    if (!valRes.valid) {
-      return res.status(400).json({ message: valRes.message });
+    const numericValue = Number(value);
+
+    const hasMin =
+      minWeightKg !== undefined && minWeightKg !== null && minWeightKg !== '';
+    const hasMax =
+      maxWeightKg !== undefined && maxWeightKg !== null && maxWeightKg !== '';
+    const hasFlat =
+      flatChargePkr !== undefined &&
+      flatChargePkr !== null &&
+      flatChargePkr !== '';
+    const hasOver =
+      overagePerKgPkr !== undefined &&
+      overagePerKgPkr !== null &&
+      overagePerKgPkr !== '';
+
+    if (!(hasMin || hasMax || hasFlat || hasOver)) {
+      return res.status(400).json({
+        message:
+          'At least one of minWeightKg, maxWeightKg, flatChargePkr or overagePerKgPkr is required',
+      });
     }
 
-    const normalizedBrackets = (weightBrackets || [])
-      .map((b) => ({
-        minKg: Number(b.minKg),
-        maxKg:
-          b.maxKg === null || b.maxKg === undefined || b.maxKg === ''
-            ? null
-            : Number(b.maxKg),
-        chargePkr: Number(b.charge || 0),
-      }))
-      .filter((b) => !Number.isNaN(b.minKg) && !Number.isNaN(b.chargePkr));
+    const min = hasMin ? Number(minWeightKg) : 0;
+    const max = hasMax ? Number(maxWeightKg) : null;
+    const flat = hasFlat ? Number(flatChargePkr) : 0;
+    const over = hasOver ? Number(overagePerKgPkr) : 0;
+
+    if (!Number.isFinite(min) || min < 0) {
+      return res
+        .status(400)
+        .json({ message: 'minWeightKg must be a non-negative number' });
+    }
+    if (max !== null && (!Number.isFinite(max) || max <= min)) {
+      return res
+        .status(400)
+        .json({ message: 'maxWeightKg must be greater than minWeightKg' });
+    }
+    if (!Number.isFinite(flat) || flat < 0) {
+      return res
+        .status(400)
+        .json({ message: 'flatChargePkr must be a non-negative number' });
+    }
+    if (!Number.isFinite(over) || over < 0) {
+      return res
+        .status(400)
+        .json({ message: 'overagePerKgPkr must be a non-negative number' });
+    }
+
+    const rcNum =
+      returnCharge === undefined || returnCharge === null
+        ? 0
+        : Number(returnCharge);
+    const safeReturnCharge =
+      Number.isNaN(rcNum) || rcNum < 0 ? 0 : Math.trunc(rcNum);
 
     let result;
 
@@ -421,57 +545,33 @@ exports.putConfigByShipper = async (req, res, next) => {
     );
 
     await prisma.$transaction(async (tx) => {
-      let existing = await tx.commissionConfig.findUnique({
+      const existing = await tx.commissionConfig.findUnique({
         where: { shipperId },
+        include: { weightBrackets: true },
       });
+
+      const data = {
+        type,
+        value: numericValue,
+        minWeightKg: min,
+        maxWeightKg: max,
+        flatChargePkr: Math.trunc(flat),
+        overagePerKgPkr: Math.trunc(over),
+        returnCharge: safeReturnCharge,
+      };
 
       if (!existing) {
         result = await tx.commissionConfig.create({
           data: {
             shipperId,
-            type,
-            value,
-            returnCharge:
-              returnCharge === undefined || returnCharge === null
-                ? 0
-                : Number.isNaN(Number(returnCharge))
-                  ? 0
-                  : Number(returnCharge),
-            weightBrackets: {
-              create: normalizedBrackets.map((b) => ({
-                minKg: b.minKg,
-                maxKg: b.maxKg,
-                chargePkr: b.chargePkr,
-              })),
-            },
+            ...data,
           },
           include: { weightBrackets: true },
         });
       } else {
-        await tx.weightBracket.deleteMany({
-          where: { commissionConfigId: existing.id },
-        });
-
-        if (normalizedBrackets.length) {
-          await tx.weightBracket.createMany({
-            data: normalizedBrackets.map((b) => ({
-              commissionConfigId: existing.id,
-              minKg: b.minKg,
-              maxKg: b.maxKg,
-              chargePkr: b.chargePkr,
-            })),
-          });
-        }
-
-        const updateData = { type, value };
-        if (returnCharge !== undefined) {
-          const rcNum = Number(returnCharge);
-          updateData.returnCharge = Number.isNaN(rcNum) ? 0 : rcNum;
-        }
-
         result = await tx.commissionConfig.update({
           where: { id: existing.id },
-          data: updateData,
+          data,
           include: { weightBrackets: true },
         });
       }

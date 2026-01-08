@@ -2,6 +2,7 @@ const generateBookingId = require('../config/bookingId');
 const generateTrackingId = require('../config/trackingId');
 const QRCode = require('qrcode');
 const prisma = require('../prismaClient');
+const { computeServiceChargeKgBased } = require('../utils/serviceChargeCalculator');
 
 // Map Prisma Order + relations into the shape the React frontend expects
 function mapOrderToApi(order) {
@@ -65,36 +66,36 @@ const createOrder = async (req, res, next) => {
     const bookingId = await generateBookingId();
     const trackingId = await generateTrackingId();
 
-    // Commission Config/weight-based logic via Prisma
+    // Commission Config/weight-based logic via Prisma (single-rule + legacy
+    // brackets fallback handled by computeServiceChargeKgBased)
     const commissionConfig = await prisma.commissionConfig.findUnique({
       where: { shipperId },
       include: { weightBrackets: true },
     });
 
-    if (!commissionConfig || !Array.isArray(commissionConfig.weightBrackets) || commissionConfig.weightBrackets.length === 0) {
+    if (!commissionConfig) {
       return res
         .status(400)
-        .json({ message: 'No commission weight brackets configured for this shipper' });
+        .json({ message: 'No commission configuration found for this shipper' });
     }
-
-    const bracketsSorted = commissionConfig.weightBrackets
-      .slice()
-      .sort((a, b) => a.minKg - b.minKg);
 
     const numericWeight = Number(weightKg);
-    const matching = bracketsSorted.find((b) => {
-      const withinMin = numericWeight >= b.minKg;
-      const withinMax = b.maxKg == null || numericWeight < b.maxKg;
-      return withinMin && withinMax;
-    });
+    const { serviceCharges, rule } = computeServiceChargeKgBased(
+      numericWeight,
+      commissionConfig,
+    );
 
-    if (!matching) {
+    if (!rule) {
       return res
         .status(400)
-        .json({ message: 'No weight bracket matched for this shipper' });
+        .json({ message: 'No commission rule configured for this shipper' });
     }
 
-    const serviceCharges = matching.chargePkr;
+    if (!serviceCharges || serviceCharges <= 0) {
+      return res.status(400).json({
+        message: 'No commission rule matched for this weight for this shipper',
+      });
+    }
 
     const numericCod = Number(codAmount || 0);
     const effectivePaymentType = paymentType || (numericCod > 0 ? 'COD' : 'ADVANCE');

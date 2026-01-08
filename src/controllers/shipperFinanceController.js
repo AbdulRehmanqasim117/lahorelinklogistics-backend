@@ -1,20 +1,33 @@
 const prisma = require('../prismaClient');
+const { normalizeCommissionRule } = require('../utils/serviceChargeCalculator');
 
 const formatPolicy = (cfg) => {
   if (!cfg) return null;
-  const brackets = Array.isArray(cfg.weightBrackets) ? cfg.weightBrackets : [];
+
+  // Prefer the new single-rule fields, falling back to legacy weightBrackets
+  // via the shared normalizer so behaviour stays consistent across the app.
+  const rule = normalizeCommissionRule(cfg);
+
+  if (!rule) {
+    return {
+      type: cfg.type,
+      value: cfg.value,
+      weightBrackets: [],
+    };
+  }
+
   return {
     type: cfg.type,
     value: cfg.value,
-    weightBrackets: brackets
-      .slice()
-      .sort((a, b) => Number(a.minKg || 0) - Number(b.minKg || 0))
-      .map((b) => ({
-        minKg: b.minKg,
-        maxKg: b.maxKg === undefined ? null : b.maxKg,
-        // Prisma uses chargePkr; legacy Mongoose used charge
-        charge: b.chargePkr !== undefined ? b.chargePkr : b.charge,
-      })),
+    // For UI compatibility we still expose a weightBrackets array, but it will
+    // contain a single synthetic bracket representing the main rule.
+    weightBrackets: [
+      {
+        minKg: rule.minWeightKg,
+        maxKg: rule.maxWeightKg === undefined ? null : rule.maxWeightKg,
+        charge: rule.flatChargePkr,
+      },
+    ],
   };
 };
 

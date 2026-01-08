@@ -2,6 +2,7 @@ const generateBookingId = require('../config/bookingId');
 const generateTrackingId = require('../config/trackingId');
 const mappers = require('../utils/providerMappers');
 const prisma = require('../prismaClient');
+const { computeServiceChargeKgBased } = require('../utils/serviceChargeCalculator');
 
 const PROVIDERS = {
   custom: { name: 'CUSTOM', mapper: mappers.mapCustom },
@@ -88,34 +89,35 @@ exports.handleProviderOrder = (providerKey) => async (req, res, next) => {
       include: { weightBrackets: true },
     });
 
-    if (
-      !commissionConfig ||
-      !Array.isArray(commissionConfig.weightBrackets) ||
-      commissionConfig.weightBrackets.length === 0
-    ) {
+    if (!commissionConfig) {
       return sendError(
         res,
         400,
-        'No commission weight brackets configured for this shipper',
+        'No commission configuration found for this shipper',
       );
     }
 
-    const bracketsSorted = commissionConfig.weightBrackets
-      .slice()
-      .sort((a, b) => a.minKg - b.minKg);
-
     const numericWeight = Number(mapped.weightKg);
-    const matching = bracketsSorted.find((b) => {
-      const withinMin = numericWeight >= b.minKg;
-      const withinMax = b.maxKg == null || numericWeight < b.maxKg;
-      return withinMin && withinMax;
-    });
+    const { serviceCharges, rule } = computeServiceChargeKgBased(
+      numericWeight,
+      commissionConfig,
+    );
 
-    if (!matching) {
-      return sendError(res, 400, 'No weight bracket matched for this shipper');
+    if (!rule) {
+      return sendError(
+        res,
+        400,
+        'No commission rule configured for this shipper',
+      );
     }
 
-    const serviceCharges = matching.chargePkr;
+    if (!serviceCharges || serviceCharges <= 0) {
+      return sendError(
+        res,
+        400,
+        'No commission rule matched for this weight for this shipper',
+      );
+    }
 
     const numericCod = Number(mapped.codAmount || 0);
     const paymentType =

@@ -5,6 +5,7 @@ const { sendResetEmail } = require('../utils/mailer');
 const { OAuth2Client } = require('google-auth-library');
 const { google } = require('googleapis');
 const prisma = require('../prismaClient');
+const { normalizeCommissionRule } = require('../utils/serviceChargeCalculator');
 
 // Centralized backend URL helpers
 const API_BASE_URL = (process.env.API_BASE_URL || process.env.API_URL || process.env.SERVER_URL || '').replace(/\/$/, '');
@@ -182,14 +183,18 @@ exports.me = async (req, res, next) => {
     let portalActive;
     let weightBracketsCount = null;
 
-    // For SHIPPER accounts, derive portalActive and weightBracketsCount from
-    // commission configuration so the frontend can gate portal access.
+    // For SHIPPER accounts, derive portalActive from the Prisma-based
+    // commission configuration using the same normalizer as the service charge
+    // calculator. This effectively means: portal is active once a valid
+    // commission rule is configured for the shipper.
     if (user.role === 'SHIPPER') {
       const cfg = commissionConfig;
-      const brackets = cfg?.weightBrackets || [];
-      const hasBrackets = Array.isArray(brackets) && brackets.length > 0;
-      weightBracketsCount = hasBrackets ? brackets.length : 0;
-      portalActive = hasBrackets;
+      const rule = normalizeCommissionRule(cfg || null);
+      const hasRule = !!rule;
+      portalActive = hasRule;
+      // Keep legacy field for compatibility; since we now use a single rule,
+      // treat it as exactly one "bracket" when present.
+      weightBracketsCount = hasRule ? 1 : 0;
     }
 
     const responseUser = {
