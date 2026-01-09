@@ -365,19 +365,28 @@ const assignRider = async (req, res, next) => {
 
 const createFinancialTransaction = async (order) => {
   try {
-    const isDelivered = order.status === 'DELIVERED';
-    const cod = isDelivered ? Number(order.amountCollected ?? order.codAmount ?? 0) : 0;
+    const finalStatus = String(order.status || '').toUpperCase();
+    const isDelivered = finalStatus === 'DELIVERED';
 
-    if (!isDelivered || cod <= 0) {
+    // Only create transactions for final rider-impacting statuses
+    if (!['DELIVERED', 'RETURNED', 'FAILED'].includes(finalStatus)) {
       return;
     }
 
-    const cfg = await prisma.commissionConfig.findUnique({ where: { shipperId: order.shipperId } });
+    const codCollected =
+      isDelivered && order.paymentType === 'COD'
+        ? Number(order.amountCollected ?? order.codAmount ?? 0)
+        : 0;
+    const originalCod = Number(order.codAmount || 0);
+
+    const cfg = await prisma.commissionConfig.findUnique({
+      where: { shipperId: order.shipperId },
+    });
 
     let companyCommission = 0;
     if (cfg) {
       if (cfg.type === 'PERCENTAGE') {
-        companyCommission = Math.round((cod * cfg.value) / 100);
+        companyCommission = Math.round((codCollected * cfg.value) / 100);
       } else {
         companyCommission = cfg.value;
       }
@@ -389,34 +398,47 @@ const createFinancialTransaction = async (order) => {
         where: { riderId: order.assignedRiderId },
         include: { rules: true },
       });
+
       if (riderCfg) {
-        let rule = riderCfg.rules.find((r) => r.status === 'DELIVERED');
-        if (rule) {
-          if (rule.type === 'PERCENTAGE') {
-            riderCommission = Math.round((cod * rule.value) / 100);
-          } else {
-            riderCommission = rule.value;
+        const codBase = isDelivered ? codCollected : originalCod;
+
+        const applyRule = (type, value) => {
+          const numericValue = Number(value || 0);
+          if (type === 'PERCENTAGE') {
+            return Math.round((Number(codBase || 0) * numericValue) / 100);
           }
+          return numericValue;
+        };
+
+        const rulesArray = Array.isArray(riderCfg.rules) ? riderCfg.rules : [];
+        const rule = rulesArray.find((r) => r.status === finalStatus) || null;
+
+        if (rule && rule.value != null) {
+          const typeToUse = rule.type || riderCfg.type || 'FLAT';
+          riderCommission = applyRule(typeToUse, rule.value);
         } else if (riderCfg.type && riderCfg.value != null) {
-          if (riderCfg.type === 'PERCENTAGE') {
-            riderCommission = Math.round((cod * riderCfg.value) / 100);
-          } else {
-            riderCommission = riderCfg.value;
-          }
+          riderCommission = applyRule(riderCfg.type, riderCfg.value);
         }
       }
     }
 
-    companyCommission = Math.min(companyCommission, cod);
-    riderCommission = Math.min(riderCommission, cod);
-    const shipperShare = cod - companyCommission;
+    // For delivered COD orders, do not allow rider commission to exceed collected COD.
+    if (isDelivered) {
+      const codForClamp = codCollected;
+      if (codForClamp > 0 && riderCommission > codForClamp) {
+        riderCommission = codForClamp;
+      }
+    }
+
+    companyCommission = Math.min(companyCommission, codCollected);
+    const shipperShare = codCollected - companyCommission;
 
     await prisma.financialTransaction.upsert({
       where: { orderId: order.id },
       update: {
         shipperId: order.shipperId,
         riderId: order.assignedRiderId ?? null,
-        totalCodCollected: cod,
+        totalCodCollected: codCollected,
         shipperShare,
         companyCommission,
         riderCommission,
@@ -425,7 +447,7 @@ const createFinancialTransaction = async (order) => {
         orderId: order.id,
         shipperId: order.shipperId,
         riderId: order.assignedRiderId ?? null,
-        totalCodCollected: cod,
+        totalCodCollected: codCollected,
         shipperShare,
         companyCommission,
         riderCommission,

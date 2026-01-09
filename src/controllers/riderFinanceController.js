@@ -105,7 +105,12 @@ exports.getMyFinance = async (req, res, next) => {
         codAmount = 0;
       }
 
-      let riderEarning = Number(tx?.riderCommission || 0);
+      let riderEarning = Number(
+        o.riderEarning !== undefined && o.riderEarning !== null
+          ? o.riderEarning
+          : tx?.riderCommission || 0,
+      );
+
       if (!Number.isFinite(riderEarning) || riderEarning < 0) {
         riderEarning = 0;
       }
