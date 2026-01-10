@@ -8,6 +8,7 @@ const {
   getCompanyProfile,
   updateCompanyProfile,
   uploadCompanyLogo,
+  getCompanyLogoFile,
   getPublicCompanyInfo
 } = require('../controllers/companyProfileController');
 
@@ -54,8 +55,9 @@ const upload = multer({
   }
 });
 
-// Public route - Get public company info (for invoices, public displays)
+// Public routes - company info + logo file (for invoices, public displays)
 router.get('/public', getPublicCompanyInfo);
+router.get('/logo/:filename', getCompanyLogoFile);
 
 // Protected routes - require authentication
 router.use(auth);

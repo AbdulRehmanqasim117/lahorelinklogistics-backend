@@ -1,4 +1,6 @@
 const prisma = require('../prismaClient');
+const path = require('path');
+const fs = require('fs');
 
 // Helper to load (or lazily create) the active company profile
 async function getOrCreateActiveProfile() {
@@ -33,14 +35,98 @@ function mapProfileToApiShape(profile) {
   };
 }
 
+function resolveLogoUrlForResponse(logoUrl, req) {
+  if (!logoUrl) return '';
+
+  const asString = String(logoUrl);
+
+  // Legacy values stored as /uploads/company/filename should be served
+  // through the API path so they work correctly behind /api proxies.
+  if (asString.startsWith('/uploads/company/')) {
+    const filename = path.basename(asString);
+    const base = req.baseUrl || '/api/company-profile';
+    return `${base}/logo/${filename}`;
+  }
+
+  return asString;
+}
+
+// Serve the stored company logo file via an API path so that frontends
+// can reliably load it even when the API is running behind a proxy.
+// If the specific logo filename referenced in the DB no longer exists on
+// disk (for example after a redeploy or manual cleanup), we attempt to
+// fall back to the most recently modified company logo in the uploads
+// directory so that the UI still has a logo to display.
+const getCompanyLogoFile = async (req, res) => {
+  try {
+    const filename = path.basename(req.params.filename || '');
+    if (!filename) {
+      return res.status(400).send('Invalid logo filename');
+    }
+
+    const dirPath = path.join(__dirname, '../../uploads/company');
+    const filePath = path.join(dirPath, filename);
+
+    if (!fs.existsSync(filePath)) {
+      // Requested logo file does not exist on disk. Try to serve the latest
+      // available logo from the uploads directory as a graceful fallback.
+      try {
+        if (fs.existsSync(dirPath)) {
+          const files = fs
+            .readdirSync(dirPath)
+            .filter((name) => name.toLowerCase().startsWith('company-logo-'));
+
+          if (files.length > 0) {
+            const latest = files
+              .map((name) => {
+                try {
+                  const fullPath = path.join(dirPath, name);
+                  const stat = fs.statSync(fullPath);
+                  return { name, mtime: stat.mtime };
+                } catch (e) {
+                  return null;
+                }
+              })
+              .filter(Boolean)
+              .sort((a, b) => b.mtime - a.mtime)[0];
+
+            if (latest && latest.name) {
+              const fallbackPath = path.join(dirPath, latest.name);
+              console.warn('Company logo file missing, using fallback', {
+                requested: filename,
+                fallback: latest.name,
+              });
+              return res.sendFile(fallbackPath);
+            }
+          }
+        }
+      } catch (innerError) {
+        console.error('Error resolving fallback company logo file:', innerError);
+      }
+
+      // No suitable fallback found
+      return res.status(404).send('Logo not found');
+    }
+
+    return res.sendFile(filePath);
+  } catch (error) {
+    console.error('Error serving company logo file:', error);
+    return res.status(500).send('Failed to load logo');
+  }
+};
+
 // Get active company profile
 const getCompanyProfile = async (req, res) => {
   try {
     const profile = await getOrCreateActiveProfile();
+    const mapped = mapProfileToApiShape(profile);
+    if (mapped) {
+      mapped.logoUrl = resolveLogoUrlForResponse(mapped.logoUrl, req);
+    }
 
     res.json({
       success: true,
-      data: mapProfileToApiShape(profile),
+      data: mapped,
     });
   } catch (error) {
     console.error('Error fetching company profile:', error);
@@ -109,10 +195,15 @@ const updateCompanyProfile = async (req, res) => {
       data: updateData,
     });
 
+    const mapped = mapProfileToApiShape(profile);
+    if (mapped) {
+      mapped.logoUrl = resolveLogoUrlForResponse(mapped.logoUrl, req);
+    }
+
     res.json({
       success: true,
       message: 'Company profile updated successfully',
-      data: mapProfileToApiShape(profile),
+      data: mapped,
     });
   } catch (error) {
     console.error('Error updating company profile:', error);
@@ -134,21 +225,28 @@ const uploadCompanyLogo = async (req, res) => {
       });
     }
 
-    // For now, we'll store the file path. In production, you might want to use cloud storage
-    const logoUrl = `/uploads/company/${req.file.filename}`;
+    // For now, we'll store the file path on disk, but expose it via an
+    // API URL so that frontends behind a proxy can load it reliably.
+    const storedPath = `/uploads/company/${req.file.filename}`;
 
     const active = await getOrCreateActiveProfile();
     const profile = await prisma.companyProfile.update({
       where: { id: active.id },
-      data: { logoUrl },
+      data: { logoUrl: storedPath },
     });
+
+    const responseLogoUrl = resolveLogoUrlForResponse(storedPath, req);
+    const mapped = mapProfileToApiShape(profile);
+    if (mapped) {
+      mapped.logoUrl = responseLogoUrl;
+    }
 
     res.json({
       success: true,
       message: 'Company logo uploaded successfully',
       data: {
-        logoUrl,
-        profile: mapProfileToApiShape(profile),
+        logoUrl: responseLogoUrl,
+        profile: mapped,
       },
     });
   } catch (error) {
@@ -169,7 +267,7 @@ const getPublicCompanyInfo = async (req, res) => {
 
     const publicInfo = {
       companyName: mapped.companyName,
-      logoUrl: mapped.logoUrl,
+      logoUrl: resolveLogoUrlForResponse(mapped.logoUrl, req),
       address: mapped.address,
       phone: mapped.phone,
       email: mapped.email,
@@ -195,5 +293,6 @@ module.exports = {
   getCompanyProfile,
   updateCompanyProfile,
   uploadCompanyLogo,
+  getCompanyLogoFile,
   getPublicCompanyInfo,
 };
