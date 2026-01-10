@@ -8,13 +8,36 @@ const { computeServiceChargeKgBased } = require('../utils/serviceChargeCalculato
 function mapOrderToApi(order) {
   if (!order) return null;
 
-  const { shipper, assignedRider, ...o } = order;
+  const { shipper, assignedRider, statusEvents, ...o } = order;
 
   const base = {
     ...o,
     id: o.id,
     _id: o.id,
   };
+
+  // Backwards-compatible activity timeline used by CEO dashboard and
+  // other legacy UIs that expect `statusHistory` on the order object.
+  if (Array.isArray(statusEvents) && statusEvents.length) {
+    base.statusHistory = statusEvents.map((ev) => ({
+      status: ev.status,
+      timestamp: ev.createdAt,
+      note: ev.note,
+      updatedBy: ev.createdById,
+    }));
+  } else {
+    // Fallback: synthesize a minimal history entry from the current
+    // order status so activity feeds are never completely empty, even
+    // for legacy orders created before OrderEvent was introduced.
+    base.statusHistory = [
+      {
+        status: o.status,
+        timestamp: o.updatedAt || o.createdAt,
+        note: null,
+        updatedBy: null,
+      },
+    ];
+  }
 
   // Surface Shopify order number explicitly for integrated orders so
   // frontends don't have to know about internal column naming.
@@ -209,6 +232,11 @@ const getOrders = async (req, res, next) => {
         },
         assignedRider: {
           select: { id: true, name: true, phone: true },
+        },
+        // Expose normalized status events so we can derive legacy
+        //-style statusHistory for activity feeds.
+        statusEvents: {
+          orderBy: { createdAt: 'asc' },
         },
       },
       orderBy: { createdAt: 'desc' },
