@@ -129,7 +129,6 @@ function buildOrderFiltersFromQuery(query) {
 // Prisma-based equivalent for order filters used in company finance
 function buildPrismaOrderWhere(filters) {
   const where = {
-    paymentType: 'COD',
     isDeleted: false,
     status: { in: ['DELIVERED', 'RETURNED', 'FAILED'] },
   };
@@ -536,8 +535,6 @@ exports.getCompanyFinanceSummary = async (req, res, next) => {
     let settledRiderTransactionsCount = 0;
     let totalRiderPaid = 0;
     let totalCompanyCommission = 0;
-    let profitUsingCommission = 0;
-    let profitUsingServiceCharges = 0;
 
     for (const o of orders) {
       const tx = o.financialTransaction;
@@ -551,7 +548,6 @@ exports.getCompanyFinanceSummary = async (req, res, next) => {
       const serviceChargesEff = Number(o.serviceCharges || 0);
       const riderPaid = tx && tx.riderCommission ? Number(tx.riderCommission) : 0;
       const companyCommissionEff = tx && tx.companyCommission ? Number(tx.companyCommission) : 0;
-      const hasCompanyCommission = companyCommissionEff > 0;
       const settlementStatusEff = String(tx?.settlementStatus || 'UNPAID').toUpperCase();
 
       totalCod += codEffective;
@@ -569,16 +565,16 @@ exports.getCompanyFinanceSummary = async (req, res, next) => {
       if (['PAID', 'SETTLED'].includes(settlementStatusEff) && riderPaid > 0) {
         settledRiderTransactionsCount += 1;
       }
-
-      if (hasCompanyCommission) {
-        profitUsingCommission += companyCommissionEff - riderPaid;
-      } else {
-        profitUsingServiceCharges += serviceChargesEff - riderPaid;
-      }
     }
 
-    const totalAmount = totalCod + totalServiceCharges;
-    const companyProfit = profitUsingCommission + profitUsingServiceCharges;
+    const codCollected = totalCod;
+    const serviceChargesTotal = totalServiceCharges;
+    const riderPayoutTotal = totalRiderPaid;
+    const netProfit = serviceChargesTotal - riderPayoutTotal;
+
+    // Backwards-compatible fields used by existing dashboards
+    const totalAmount = codCollected + serviceChargesTotal;
+    const companyProfit = netProfit;
     const unpaidRiderBalances = pendingRiderSettlementsAmount;
 
     res.json({
@@ -591,8 +587,9 @@ exports.getCompanyFinanceSummary = async (req, res, next) => {
       },
       metrics: {
         ordersCount,
-        totalCod,
-        totalServiceCharges,
+        // Legacy-style totals kept for compatibility
+        totalCod: codCollected,
+        totalServiceCharges: serviceChargesTotal,
         totalAmount,
         deliveredOrders,
         returnedOrders,
@@ -600,9 +597,14 @@ exports.getCompanyFinanceSummary = async (req, res, next) => {
         pendingRiderSettlementsAmount,
         settledRiderTransactionsCount,
         unpaidRiderBalances,
-        totalRiderPaid,
+        totalRiderPaid: riderPayoutTotal,
         totalCompanyCommission,
         companyProfit,
+        // New explicit metrics for CEO finance dashboard
+        codCollected,
+        serviceChargesTotal,
+        riderPayoutTotal,
+        netProfit,
       },
     });
   } catch (error) {
@@ -645,7 +647,6 @@ exports.getCompanyLedger = async (req, res, next) => {
       const serviceChargesEff = Number(o.serviceCharges || 0);
       const riderPaid = tx && tx.riderCommission ? Number(tx.riderCommission) : 0;
       const companyCommissionEff = tx && tx.companyCommission ? Number(tx.companyCommission) : 0;
-      const hasCompanyCommission = companyCommissionEff > 0;
       const settlementStatusEff = String(tx?.settlementStatus || 'UNPAID').toUpperCase();
 
       const riderPayoutPaidComponent =
@@ -656,10 +657,7 @@ exports.getCompanyLedger = async (req, res, next) => {
         riderPaid > 0 && ['UNPAID', 'PENDING'].includes(settlementStatusEff)
           ? riderPaid
           : 0;
-
-      const companyProfitPerOrder = hasCompanyCommission
-        ? companyCommissionEff - riderPaid
-        : serviceChargesEff - riderPaid;
+      const companyProfitPerOrder = serviceChargesEff - riderPaid;
 
       const shipperName = o.shipper?.companyName || o.shipper?.name || '';
 
@@ -701,6 +699,8 @@ exports.getCompanyLedger = async (req, res, next) => {
 
     totals.totalRiderPayout =
       totals.totalRiderPayoutPaid + totals.totalRiderPayoutUnpaid;
+    // Alias for clarity in frontend: COD is shipper funds, not revenue.
+    totals.codCollected = totals.totalCod;
 
     res.json({
       rows,
