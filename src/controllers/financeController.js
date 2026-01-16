@@ -518,6 +518,33 @@ exports.getCompanyFinanceSummary = async (req, res, next) => {
     const filters = buildOrderFiltersFromQuery(req.query);
     const where = buildPrismaOrderWhere(filters);
 
+    // By default, when no explicit date range is provided, we scope the
+    // summary to the currently active finance period. This ensures that
+    // after closing a month, metrics reset for the new period instead of
+    // always showing all-time totals.
+    const activePeriod = await getOrCreateActiveFinancePeriod(
+      req.user && req.user.id,
+    );
+
+    const hasExplicitRange =
+      filters.dateRange && (filters.dateRange.start || filters.dateRange.end);
+
+    console.log('DEBUG getCompanyFinanceSummary filters:', filters);
+    console.log('DEBUG getCompanyFinanceSummary activePeriod:', activePeriod);
+    console.log('DEBUG getCompanyFinanceSummary initial where:', where);
+
+    if (!hasExplicitRange && activePeriod && activePeriod.periodStart) {
+      const end = activePeriod.periodEnd || new Date();
+      where.createdAt = {
+        gte: activePeriod.periodStart,
+        lte: end,
+      };
+      console.log(
+        'DEBUG getCompanyFinanceSummary applying activePeriod window:',
+        where.createdAt,
+      );
+    }
+
     const orders = await prisma.order.findMany({
       where,
       include: {
@@ -606,6 +633,12 @@ exports.getCompanyFinanceSummary = async (req, res, next) => {
         riderPayoutTotal,
         netProfit,
       },
+      // Debug info to inspect active finance window without relying on server logs
+      debug: {
+        rawFilters: filters,
+        activePeriod,
+        whereCreatedAt: where.createdAt || null,
+      },
     });
   } catch (error) {
     next(error);
@@ -616,12 +649,34 @@ exports.getCompanyFinanceSummary = async (req, res, next) => {
 // GET /api/finance/company/ledger
 exports.getCompanyLedger = async (req, res, next) => {
   try {
+    const filters = buildOrderFiltersFromQuery(req.query);
+    const where = buildPrismaOrderWhere(filters);
+
     const activePeriod = await getOrCreateActiveFinancePeriod(
       req.user && req.user.id,
     );
 
-    const filters = buildOrderFiltersFromQuery(req.query);
-    const where = buildPrismaOrderWhere(filters);
+    // Similar to the summary endpoint, when no explicit date range is
+    // provided we default the ledger view to the active finance
+    // period's start/end dates.
+    const hasExplicitRange =
+      filters.dateRange && (filters.dateRange.start || filters.dateRange.end);
+
+    console.log('DEBUG getCompanyLedger filters:', filters);
+    console.log('DEBUG getCompanyLedger activePeriod:', activePeriod);
+    console.log('DEBUG getCompanyLedger initial where:', where);
+
+    if (!hasExplicitRange && activePeriod && activePeriod.periodStart) {
+      const end = activePeriod.periodEnd || new Date();
+      where.createdAt = {
+        gte: activePeriod.periodStart,
+        lte: end,
+      };
+      console.log(
+        'DEBUG getCompanyLedger applying activePeriod window:',
+        where.createdAt,
+      );
+    }
 
     const orders = await prisma.order.findMany({
       where,
@@ -657,6 +712,10 @@ exports.getCompanyLedger = async (req, res, next) => {
         riderPaid > 0 && ['UNPAID', 'PENDING'].includes(settlementStatusEff)
           ? riderPaid
           : 0;
+      // For per-order view and summary cards we want to show the full
+      // rider commission as "Rider Payout", regardless of whether it
+      // has been settled yet. Paid vs unpaid is still tracked in the full
+      // totals via riderPayoutPaidComponent / riderPayoutUnpaidComponent.
       const companyProfitPerOrder = serviceChargesEff - riderPaid;
 
       const shipperName = o.shipper?.companyName || o.shipper?.name || '';
@@ -670,7 +729,10 @@ exports.getCompanyLedger = async (req, res, next) => {
         trackingId: o.trackingId,
         cod: codEffective,
         serviceCharges: serviceChargesEff,
-        riderPayout: riderPayoutPaidComponent,
+        // Full rider commission for this order
+        riderPayout: riderPaid,
+        // Paid/unpaid components are used only for aggregated totals
+        riderPayoutPaid: riderPayoutPaidComponent,
         riderPayoutUnpaid: riderPayoutUnpaidComponent,
         companyProfit: companyProfitPerOrder,
         status: effectiveStatus,
@@ -681,8 +743,11 @@ exports.getCompanyLedger = async (req, res, next) => {
       (acc, row) => {
         acc.totalCod += row.cod;
         acc.totalServiceCharges += row.serviceCharges;
-        acc.totalRiderPayoutPaid += row.riderPayout;
-        acc.totalRiderPayoutUnpaid += row.riderPayoutUnpaid;
+        // Use the explicit paid/unpaid components for accurate
+        // aggregation, while the visible Rider Payout column shows the
+        // full rider commission per order.
+        acc.totalRiderPayoutPaid += row.riderPayoutPaid || 0;
+        acc.totalRiderPayoutUnpaid += row.riderPayoutUnpaid || 0;
         acc.totalCompanyProfit += row.companyProfit;
         acc.totalOrders += 1;
         return acc;
@@ -706,6 +771,12 @@ exports.getCompanyLedger = async (req, res, next) => {
       rows,
       totals,
       activePeriod,
+      // Debug info so frontend can inspect date filters / period without
+      // needing access to server console logs
+      debug: {
+        rawFilters: filters,
+        whereCreatedAt: where.createdAt || null,
+      },
     });
   } catch (error) {
     next(error);
@@ -729,9 +800,17 @@ exports.closeCurrentFinanceMonth = async (req, res, next) => {
       active = await getOrCreateActiveFinancePeriod(closedById);
     }
 
+    // Close the current period up to "today" rather than strictly
+    // calendar month boundaries. This makes the behaviour of the
+    // "Close Current Month" button intuitive for the CEO: after
+    // closing, all existing finance activity is locked into the
+    // closed period and the new active period starts fresh from the
+    // next day (showing zeros until new orders are delivered).
+
+    const now = new Date();
     const periodStart = new Date(active.periodStart);
-    const periodEnd = new Date(periodStart);
-    periodEnd.setMonth(periodEnd.getMonth() + 1, 0);
+    const periodEnd = new Date(now);
+    // Normalize to end-of-day for the close timestamp
     periodEnd.setHours(23, 59, 59, 999);
 
     const closed = await prisma.financePeriod.update({
@@ -744,6 +823,9 @@ exports.closeCurrentFinanceMonth = async (req, res, next) => {
       },
     });
 
+    // New active period starts from the next calendar day at
+    // midnight, so it will not include any of the orders that were
+    // part of the closed period.
     const nextStart = new Date(periodEnd.getTime() + 1);
     nextStart.setHours(0, 0, 0, 0);
 

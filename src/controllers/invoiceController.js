@@ -317,8 +317,10 @@ exports.createInvoice = async (req, res, next) => {
     const numericWhtIt = Number(whtIt) || 0;
     const numericWhtSt = Number(whtSt) || 0;
 
+    // Net payable to shipper: COD collected minus our service charges
+    // minus withholding taxes (WHT amounts already provided by client).
     const netPayable =
-      codTotal + serviceChargesTotal - numericWhtIt - numericWhtSt;
+      codTotal - serviceChargesTotal - numericWhtIt - numericWhtSt;
 
     const creatorRawId = req.user && (req.user.id || req.user._id);
     const creatorId = Number(creatorRawId);
