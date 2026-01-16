@@ -166,6 +166,7 @@ model User {
   weightVerifiedOrders    Order[]         @relation("WeightVerifiedBy")
   warehouseReceivedOrders Order[]         @relation("WarehouseReceivedBy")
   orderEventsCreated      OrderEvent[]    @relation("OrderEventCreatedBy")
+  orderEditsMade          OrderEditLog[]  @relation("OrderEditLogEditedBy")
 
   // Finance relations
   financialTransactionsPaid FinancialTransaction[] @relation("FinancialTransactionPaidBy")
@@ -364,6 +365,8 @@ model Order {
   ledgerEntries      ShipperLedgerEntry[]
   integratedOrdersLll IntegratedOrder[] @relation("IntegratedOrder_LllOrder")
   externalOrderLinks ExternalOrderLink[]
+  editLogs           OrderEditLog[]
+
 }
 
 model OrderEvent {
@@ -376,6 +379,24 @@ model OrderEvent {
 
   order       Order      @relation(fields: [orderId], references: [id])
   createdBy   User?      @relation("OrderEventCreatedBy", fields: [createdById], references: [id])
+}
+
+model OrderEditLog {
+  id         Int      @id @default(autoincrement())
+  orderId    Int
+  editedById Int
+  reason     String
+  before     Json
+  after      Json
+  ip         String?  @db.VarChar(100)
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  order      Order    @relation(fields: [orderId], references: [id])
+  editedBy   User     @relation("OrderEditLogEditedBy", fields: [editedById], references: [id])
+
+  @@index([orderId])
+  @@index([editedById])
 }
 
 // --- Finance ---

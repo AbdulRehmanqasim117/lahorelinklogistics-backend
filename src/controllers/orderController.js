@@ -340,6 +340,270 @@ const getOrderById = async (req, res, next) => {
   }
 };
 
+const ceoEditOrder = async (req, res, next) => {
+  try {
+    const rawId = req.params.id;
+    const orderId = Number(rawId);
+
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      return res.status(400).json({ message: 'Invalid order id' });
+    }
+
+    const role = req.user && req.user.role;
+    const rawUserId = req.user && (req.user.id || req.user._id);
+    const editedById = Number(rawUserId);
+
+    if (role !== 'CEO') {
+      return res.status(403).json({ message: 'Only CEO can edit orders' });
+    }
+    if (!Number.isInteger(editedById) || editedById <= 0) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const reasonRaw = req.body && req.body.reason;
+    const reason = typeof reasonRaw === 'string' ? reasonRaw.trim() : '';
+    if (!reason) {
+      return res.status(400).json({ message: 'Reason for change is required' });
+    }
+
+    const existing = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: {
+        financialTransaction: true,
+        invoice: true,
+      },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    const statusUpper = String(existing.status || '').toUpperCase();
+    const isFinalStatus = ['DELIVERED', 'RETURNED', 'FAILED'].includes(
+      statusUpper,
+    );
+
+    const tx = existing.financialTransaction;
+    const settlementStatusUpper = tx?.settlementStatus
+      ? String(tx.settlementStatus).toUpperCase()
+      : null;
+    const isSettled =
+      settlementStatusUpper && ['PAID', 'SETTLED'].includes(settlementStatusUpper);
+
+    const isInvoiced = !!existing.invoiceId;
+
+    if (isFinalStatus || isSettled || isInvoiced) {
+      return res.status(400).json({
+        message:
+          'This order is locked (delivered/returned/settled/invoiced) and cannot be edited.',
+      });
+    }
+
+    const {
+      paymentType: paymentTypeRaw,
+      codAmount: codAmountRaw,
+      serviceCharges: serviceChargesRaw,
+      fragile: fragileRaw,
+      pieces: piecesRaw,
+      weightKg: weightKgRaw,
+      consigneeName: consigneeNameRaw,
+      consigneePhone: consigneePhoneRaw,
+      consigneeAddress: consigneeAddressRaw,
+      destinationCity: destinationCityRaw,
+      remarks: remarksRaw,
+    } = req.body || {};
+
+    const updates = {};
+
+    // Start from existing finance values and adjust based on inputs.
+    let newPaymentType = existing.paymentType;
+    let newCodAmount = existing.codAmount;
+    let newServiceCharges = existing.serviceCharges;
+
+    if (typeof paymentTypeRaw !== 'undefined') {
+      const pt = String(paymentTypeRaw).toUpperCase();
+      if (!['COD', 'ADVANCE'].includes(pt)) {
+        return res.status(400).json({ message: 'Invalid payment type' });
+      }
+      newPaymentType = pt;
+      updates.paymentType = pt;
+    }
+
+    if (typeof codAmountRaw !== 'undefined') {
+      const codNum = Number(codAmountRaw);
+      if (!Number.isFinite(codNum) || codNum < 0) {
+        return res
+          .status(400)
+          .json({ message: 'codAmount must be a non-negative number' });
+      }
+      newCodAmount = codNum;
+    }
+
+    if (newPaymentType === 'ADVANCE') {
+      newCodAmount = 0;
+      updates.codAmount = 0;
+    } else if (typeof codAmountRaw !== 'undefined') {
+      updates.codAmount = newCodAmount;
+    }
+
+    if (typeof serviceChargesRaw !== 'undefined') {
+      const scNum = Number(serviceChargesRaw);
+      if (!Number.isFinite(scNum) || scNum < 0) {
+        return res
+          .status(400)
+          .json({ message: 'serviceCharges must be a non-negative number' });
+      }
+      newServiceCharges = scNum;
+      updates.serviceCharges = scNum;
+    }
+
+    if (typeof fragileRaw !== 'undefined') {
+      updates.fragile = Boolean(fragileRaw);
+    }
+
+    if (typeof piecesRaw !== 'undefined') {
+      const piecesNum = Number(piecesRaw);
+      if (!Number.isInteger(piecesNum) || piecesNum <= 0) {
+        return res
+          .status(400)
+          .json({ message: 'pieces must be a positive integer' });
+      }
+      updates.pieces = piecesNum;
+    }
+
+    if (typeof weightKgRaw !== 'undefined') {
+      const weightNum = Number(weightKgRaw);
+      if (!Number.isFinite(weightNum) || weightNum <= 0) {
+        return res
+          .status(400)
+          .json({ message: 'weightKg must be a positive number' });
+      }
+      updates.weightKg = weightNum;
+    }
+
+    if (typeof consigneeNameRaw !== 'undefined') {
+      const name = String(consigneeNameRaw).trim();
+      if (!name) {
+        return res
+          .status(400)
+          .json({ message: 'consigneeName is required and cannot be empty' });
+      }
+      updates.consigneeName = name;
+    }
+
+    if (typeof consigneePhoneRaw !== 'undefined') {
+      const phone = String(consigneePhoneRaw).trim();
+      const digits = phone.replace(/[^0-9]/g, '');
+      if (digits.length < 7 || digits.length > 15) {
+        return res.status(400).json({ message: 'Invalid consigneePhone format' });
+      }
+      updates.consigneePhone = phone;
+    }
+
+    if (typeof consigneeAddressRaw !== 'undefined') {
+      const addr = String(consigneeAddressRaw).trim();
+      if (!addr) {
+        return res
+          .status(400)
+          .json({ message: 'consigneeAddress is required and cannot be empty' });
+      }
+      updates.consigneeAddress = addr;
+    }
+
+    if (typeof destinationCityRaw !== 'undefined') {
+      const city = String(destinationCityRaw).trim();
+      if (!city) {
+        return res
+          .status(400)
+          .json({ message: 'destinationCity is required and cannot be empty' });
+      }
+      updates.destinationCity = city;
+    }
+
+    if (typeof remarksRaw !== 'undefined') {
+      const remarks =
+        remarksRaw === null || typeof remarksRaw === 'undefined'
+          ? null
+          : String(remarksRaw).trim();
+      updates.remarks = remarks;
+    }
+
+    const codForTotal =
+      typeof updates.codAmount !== 'undefined'
+        ? updates.codAmount
+        : existing.codAmount;
+    const svcForTotal =
+      typeof updates.serviceCharges !== 'undefined'
+        ? updates.serviceCharges
+        : existing.serviceCharges;
+
+    if (
+      typeof updates.codAmount !== 'undefined' ||
+      typeof updates.serviceCharges !== 'undefined' ||
+      typeof updates.paymentType !== 'undefined'
+    ) {
+      updates.totalAmount = codForTotal + svcForTotal;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: 'No editable fields provided' });
+    }
+
+    const toSnapshot = (obj) => JSON.parse(JSON.stringify(obj));
+    const beforeSnapshot = toSnapshot(existing);
+
+    const ipHeader = req.headers['x-forwarded-for'] || req.ip || '';
+    const ip =
+      typeof ipHeader === 'string'
+        ? ipHeader.split(',')[0].trim()
+        : Array.isArray(ipHeader)
+          ? ipHeader[0]
+          : '';
+    const userAgent = req.get('user-agent') || null;
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const updatedOrder = await tx.order.update({
+        where: { id: orderId },
+        data: updates,
+        include: {
+          shipper: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              companyName: true,
+              phone: true,
+            },
+          },
+          assignedRider: {
+            select: { id: true, name: true, phone: true },
+          },
+        },
+      });
+
+      const afterSnapshot = toSnapshot(updatedOrder);
+
+      await tx.orderEditLog.create({
+        data: {
+          orderId,
+          editedById,
+          reason,
+          before: beforeSnapshot,
+          after: afterSnapshot,
+          ip: ip || null,
+          userAgent,
+        },
+      });
+
+      return updatedOrder;
+    });
+
+    res.json(mapOrderToApi(updated));
+  } catch (error) {
+    next(error);
+  }
+};
+
 const assignRider = async (req, res, next) => {
   try {
     const rawId = req.params.id;
@@ -1389,5 +1653,6 @@ module.exports = {
   assignByScan,
   getOrderDetailsByBookingId,
   getPendingIntegratedOrdersForShipper,
-  rejectIntegratedOrder
+  rejectIntegratedOrder,
+  ceoEditOrder,
 };

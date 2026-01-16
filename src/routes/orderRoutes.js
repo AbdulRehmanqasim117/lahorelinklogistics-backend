@@ -29,6 +29,13 @@ router.get(
 router.get("/details/:bookingId", orderController.getOrderDetailsByBookingId);
 router.get("/:id", orderController.getOrderById);
 
+// CEO-only order edit with audit logging
+router.patch(
+  "/:id",
+  requireRole("CEO"),
+  orderController.ceoEditOrder,
+);
+
 // Read Label
 router.get("/:id/label", orderController.getLabel);
 router.get("/labels", orderController.getLabels);
