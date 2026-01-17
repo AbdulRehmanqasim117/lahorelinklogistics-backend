@@ -52,6 +52,8 @@ exports.getMyFinanceSummary = async (req, res, next) => {
           shipperId,
           isDeleted: false,
           status: { in: ['DELIVERED', 'RETURNED'] },
+          // Only consider uninvoiced (unsettled) orders for current balance
+          invoiceId: null,
         },
         select: {
           status: true,
@@ -126,6 +128,8 @@ exports.getMyFinanceLedger = async (req, res, next) => {
     const where = {
       shipperId,
       isDeleted: false,
+      // Ledger/journal should only include currently unsettled (uninvoiced) orders
+      invoiceId: null,
     };
 
     if (from || to) {
