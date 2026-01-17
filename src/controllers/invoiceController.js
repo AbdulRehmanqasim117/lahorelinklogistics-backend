@@ -22,6 +22,19 @@ const parseDateInput = (raw) => {
   return Number.isNaN(dt.getTime()) ? null : dt;
 };
 
+const computeInvoiceCodAmount = (order) => {
+  const status = String(order.status || "").toUpperCase();
+  const isDelivered = status === "DELIVERED";
+  const isCod = order.paymentType === "COD";
+
+  if (isDelivered && isCod) {
+    const cod = Number(order.amountCollected ?? order.codAmount ?? 0);
+    return Number.isNaN(cod) ? 0 : cod;
+  }
+
+  return 0;
+};
+
 // Helper function to calculate service charges if missing, delegating to the
 // centralized Prisma-based calculator that already uses the new single-rule
 // commission config logic (with legacy WeightBracket fallback).
@@ -96,7 +109,7 @@ const mapShipperForInvoice = (user) => {
 };
 
 const mapOrderForInvoiceList = (order, serviceCharges) => {
-  const codAmount = Number(order.codAmount || 0);
+  const codAmount = computeInvoiceCodAmount(order);
   const svc = Number(order.serviceCharges || serviceCharges || 0);
 
   return {
@@ -131,7 +144,7 @@ const mapInvoiceOrder = (order) => ({
   consigneeName: order.consigneeName,
   destinationCity: order.destinationCity,
   weightKg: Number(order.weightKg || 0),
-  codAmount: Number(order.codAmount || 0),
+  codAmount: computeInvoiceCodAmount(order),
   serviceCharges: Number(order.serviceCharges || 0),
   status: order.status,
 });
@@ -303,7 +316,9 @@ exports.createInvoice = async (req, res, next) => {
     let maxOrderDate = null;
 
     for (const order of orders) {
-      codTotal += Number(order.codAmount || 0);
+      const effectiveCod = computeInvoiceCodAmount(order);
+      codTotal += effectiveCod;
+
       const svc = await calculateServiceCharges(order);
       serviceChargesTotal += svc;
 

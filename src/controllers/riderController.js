@@ -148,6 +148,7 @@ exports.getDailyReport = async (req, res, next) => {
         shipper: {
           select: { name: true, companyName: true },
         },
+        financialTransaction: true,
       },
       orderBy: { createdAt: 'asc' },
     });
@@ -158,20 +159,26 @@ exports.getDailyReport = async (req, res, next) => {
     worksheet.columns = [
       { header: 'Order ID', key: 'bookingId', width: 15 },
       { header: 'Consignee Name', key: 'consigneeName', width: 25 },
+      { header: 'Consignee Phone', key: 'consigneePhone', width: 18 },
+      { header: 'Consignee Address', key: 'consigneeAddress', width: 35 },
       { header: 'COD', key: 'codAmount', width: 15 },
       { header: 'Status', key: 'status', width: 20 },
       { header: 'City', key: 'destinationCity', width: 15 },
-      { header: 'Service Charges', key: 'serviceCharges', width: 18 },
+      { header: 'Rider Charges', key: 'riderCharges', width: 18 },
     ];
 
     orders.forEach((order) => {
+      const riderCharges = Number(order.financialTransaction?.riderCommission || 0);
+
       worksheet.addRow({
         bookingId: order.bookingId,
         consigneeName: order.consigneeName,
+        consigneePhone: order.consigneePhone,
+        consigneeAddress: order.consigneeAddress,
         codAmount: order.amountCollected || order.codAmount || 0,
         status: order.status,
         destinationCity: order.destinationCity,
-        serviceCharges: order.serviceCharges || 0,
+        riderCharges,
       });
     });
 
@@ -179,8 +186,9 @@ exports.getDailyReport = async (req, res, next) => {
       (sum, o) => sum + Number(o.amountCollected || o.codAmount || 0),
       0,
     );
-    const totalServiceCharges = orders.reduce(
-      (sum, o) => sum + Number(o.serviceCharges || 0),
+    const totalRiderCharges = orders.reduce(
+      (sum, o) =>
+        sum + Number(o.financialTransaction?.riderCommission || 0),
       0,
     );
 
@@ -188,10 +196,12 @@ exports.getDailyReport = async (req, res, next) => {
     worksheet.addRow({
       bookingId: 'TOTAL',
       consigneeName: '',
+      consigneePhone: '',
+      consigneeAddress: '',
       codAmount: totalCod,
       status: '',
       destinationCity: '',
-      serviceCharges: totalServiceCharges,
+      riderCharges: totalRiderCharges,
     });
 
     worksheet.getRow(1).font = { bold: true };

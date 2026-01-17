@@ -53,10 +53,10 @@ router.patch(
   orderController.assignRider,
 );
 
-// Status: Rider or Manager
+// Status: Rider, Manager, or CEO
 router.patch(
   "/:id/status",
-  requireRole("RIDER", "MANAGER"),
+  requireRole("RIDER", "MANAGER", "CEO"),
   requireRiderCommissionConfigured,
   orderController.updateStatus,
 );
