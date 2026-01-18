@@ -211,9 +211,15 @@ exports.getOrdersForInvoice = async (req, res, next) => {
     }
 
     if (list === "invoiced") {
+      // Only orders that already belong to a saved invoice
       where.invoiceId = { not: null };
     } else if (list === "uninvoiced") {
+      // Only orders that have never been invoiced
       where.invoiceId = null;
+    } else {
+      // list === "all" (or any other value) -> do NOT filter by invoiceId at all
+      // so both paid (invoiced) and unpaid (uninvoiced) parcels are returned.
+      // Intentionally leave where.invoiceId undefined here.
     }
 
     const orders = await prisma.order.findMany({
