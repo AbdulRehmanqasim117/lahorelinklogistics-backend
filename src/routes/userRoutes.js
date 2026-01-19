@@ -9,8 +9,8 @@ router.get('/me', auth, userController.getMe);
 // CEO only endpoints
 router.get('/', auth, requireRole('CEO'), userController.getUsers);
 router.post('/', auth, requireRole('CEO'), userController.createUser);
-router.patch('/:id/status', auth, requireRole('CEO'), userController.updateUserStatus);
-router.post('/:id/reset-password', auth, requireRole('CEO'), userController.resetPassword);
+router.patch('/:id/status', auth, requireRole('CEO', 'MANAGER'), userController.updateUserStatus);
+router.post('/:id/reset-password', auth, requireRole('CEO', 'MANAGER'), userController.resetPassword);
 
 // CEO or MANAGER: list riders
 router.get('/riders', auth, requireRole('CEO', 'MANAGER'), userController.getRiders);
