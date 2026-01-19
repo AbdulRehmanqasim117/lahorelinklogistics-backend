@@ -66,6 +66,8 @@ exports.getMyFinanceSummary = async (req, res, next) => {
     ]);
 
     let balance = 0;
+    let totalCod = 0;
+    let totalServiceCharges = 0;
     for (const o of orders) {
       const isDelivered = o.status === 'DELIVERED';
       const cod =
@@ -74,7 +76,10 @@ exports.getMyFinanceSummary = async (req, res, next) => {
           : 0;
       const svc = Number(o.serviceCharges || 0);
       const receivable = cod - svc;
+
       balance += receivable;
+      totalCod += cod;
+      totalServiceCharges += svc;
     }
 
     const shipper = user
@@ -100,6 +105,11 @@ exports.getMyFinanceSummary = async (req, res, next) => {
       shipper,
       serviceChargesPolicy: formatPolicy(cfg),
       balance: Number(balance || 0),
+      totals: {
+        totalCod: Number(totalCod || 0),
+        totalServiceCharges: Number(totalServiceCharges || 0),
+        netReceivable: Number(balance || 0),
+      },
     });
   } catch (error) {
     next(error);
