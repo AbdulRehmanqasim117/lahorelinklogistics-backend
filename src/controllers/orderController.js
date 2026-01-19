@@ -84,6 +84,10 @@ const createOrder = async (req, res, next) => {
       weightKg // NEW
     } = req.body;
 
+    if (!productDescription || !String(productDescription).trim()) {
+      return res.status(400).json({ message: 'Product description is required' });
+    }
+
     if (!weightKg || weightKg <= 0) {
       return res.status(400).json({ message: 'weightKg required and must be > 0' });
     }
