@@ -204,8 +204,12 @@ exports.getRiderSettlementsAdmin = async (req, res, next) => {
       status = 'all',
       settlement = 'all',
       sortOrder = 'desc',
-      page = 1,
-      limit = 20,
+      // page/limit are no longer used since admin rider settlements now
+      // return all matching orders in a single response without
+      // pagination. We still accept them in the query for
+      // backwards-compatibility but ignore their values.
+      page,
+      limit,
       shipperId,
       search,
     } = req.query;
@@ -398,10 +402,11 @@ exports.getRiderSettlementsAdmin = async (req, res, next) => {
         unpaidBalance: Number(summary.unpaidBalance || 0),
       },
       items,
-      page: pageNum,
-      limit: limitNum,
+      // Admin view now returns all rows in a single page (no pagination).
+      page: 1,
+      limit: total,
       total,
-      totalPages: Math.ceil(total / limitNum) || 0,
+      totalPages: 1,
     });
   } catch (error) {
     next(error);

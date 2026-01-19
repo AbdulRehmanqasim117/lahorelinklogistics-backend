@@ -130,6 +130,11 @@ exports.getMyFinanceLedger = async (req, res, next) => {
     const where = {
       shipperId,
       isDeleted: false,
+      // Shipper finance ledger should only ever show final billable orders.
+      // Attempts (FIRST_ATTEMPT, SECOND_ATTEMPT, etc.) and other in-transit
+      // statuses are excluded here so that shippers only see Delivered/Returned
+      // parcels in their journal and invoices.
+      status: { in: ['DELIVERED', 'RETURNED'] },
     };
 
     if (from || to) {
@@ -174,7 +179,15 @@ exports.getMyFinanceLedger = async (req, res, next) => {
       }),
     ]);
 
-    const filteredOrders = orders.filter((o) => {
+    // Extra safety: even if anything changes in the DB query, never show
+    // non-final/attempt statuses in the shipper ledger. Only keep
+    // DELIVERED and RETURNED here.
+    const statusFiltered = orders.filter((o) => {
+      const st = String(o.status || '').toUpperCase();
+      return st === 'DELIVERED' || st === 'RETURNED';
+    });
+
+    const filteredOrders = statusFiltered.filter((o) => {
       const isInvoiced = o.invoiceId !== null && o.invoiceId !== undefined;
       const ledgerStatus = isInvoiced ? 'PAID' : 'UNPAID';
 

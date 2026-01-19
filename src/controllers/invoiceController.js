@@ -193,6 +193,10 @@ exports.getOrdersForInvoice = async (req, res, next) => {
       shipperId: shipperIdNum,
       bookingState: "BOOKED",
       isDeleted: false,
+      // Only include final billable orders in invoice flows; attempts and
+      // in-transit statuses should never appear when selecting parcels for
+      // invoicing.
+      status: { in: ["DELIVERED", "RETURNED"] },
     };
 
     if (from && to) {
@@ -236,8 +240,16 @@ exports.getOrdersForInvoice = async (req, res, next) => {
       orderBy: { createdAt: "desc" },
     });
 
+    // Hard guard on final statuses: even if query filters change later,
+    // we never want FIRST_ATTEMPT / SECOND_ATTEMPT / OFD etc. to appear in
+    // invoice parcel selection. Only DELIVERED and RETURNED are allowed.
+    const finalStatusOrders = orders.filter((order) => {
+      const st = String(order.status || "").toUpperCase();
+      return st === "DELIVERED" || st === "RETURNED";
+    });
+
     const ordersWithCharges = await Promise.all(
-      orders.map(async (order) => {
+      finalStatusOrders.map(async (order) => {
         const svc = await calculateServiceCharges(order);
         return mapOrderForInvoiceList(order, svc);
       }),
