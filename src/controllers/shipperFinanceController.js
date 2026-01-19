@@ -125,11 +125,11 @@ exports.getMyFinanceLedger = async (req, res, next) => {
       limit = 20,
     } = req.query;
 
+    const normalizedStatus = String(status || '').trim().toUpperCase();
+
     const where = {
       shipperId,
       isDeleted: false,
-      // Ledger/journal should only include currently unsettled (uninvoiced) orders
-      invoiceId: null,
     };
 
     if (from || to) {
@@ -164,7 +164,7 @@ exports.getMyFinanceLedger = async (req, res, next) => {
       ? 5000
       : Math.min(200, Math.max(1, Number(limit) || 20));
 
-    const [total, orders] = await Promise.all([
+    const [dbTotal, orders] = await Promise.all([
       prisma.order.count({ where }),
       prisma.order.findMany({
         where,
@@ -174,7 +174,24 @@ exports.getMyFinanceLedger = async (req, res, next) => {
       }),
     ]);
 
-    const rows = orders.map((o) => {
+    const filteredOrders = orders.filter((o) => {
+      const isInvoiced = o.invoiceId !== null && o.invoiceId !== undefined;
+      const ledgerStatus = isInvoiced ? 'PAID' : 'UNPAID';
+
+      if (!normalizedStatus || normalizedStatus === 'UNPAID') {
+        return ledgerStatus === 'UNPAID';
+      }
+      if (normalizedStatus === 'PAID') {
+        return ledgerStatus === 'PAID';
+      }
+      if (normalizedStatus === 'ALL') {
+        return true;
+      }
+      // Fallback to UNPAID behaviour for unknown values
+      return ledgerStatus === 'UNPAID';
+    });
+
+    const rows = filteredOrders.map((o) => {
       const isDelivered = o.status === 'DELIVERED';
       const isReturnedOrFailed = o.status === 'RETURNED' || o.status === 'FAILED';
 
@@ -193,6 +210,9 @@ exports.getMyFinanceLedger = async (req, res, next) => {
       const serviceCharges = Number(o.serviceCharges || 0);
       const receivable = codAmount - serviceCharges;
 
+      const isInvoiced = o.invoiceId !== null && o.invoiceId !== undefined;
+      const ledgerStatus = isInvoiced ? 'PAID' : 'UNPAID';
+
       return {
         _id: o.id,
         id: o.id,
@@ -204,7 +224,7 @@ exports.getMyFinanceLedger = async (req, res, next) => {
         serviceCharges,
         receivable,
         amount: receivable,
-        status: 'UNPAID',
+        status: ledgerStatus,
         weightKg: o.weightKg,
       };
     });
@@ -264,13 +284,14 @@ exports.getMyFinanceLedger = async (req, res, next) => {
       return res.send(lines.join('\n'));
     }
 
-    const totalPages = exportAll ? 1 : Math.ceil(total / limitNum) || 0;
+    const totalFiltered = rows.length;
+    const totalPages = exportAll ? 1 : Math.ceil(totalFiltered / limitNum) || 0;
 
     res.json({
       rows,
       page: pageNum,
       limit: limitNum,
-      total,
+      total: totalFiltered,
       totalPages,
       totals: {
         totalCod: Number(totals.totalCod || 0),

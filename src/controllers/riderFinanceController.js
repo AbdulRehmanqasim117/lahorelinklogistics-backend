@@ -179,10 +179,10 @@ exports.getMyFinance = async (req, res, next) => {
         unpaidBalance: Number(summary.unpaidBalance || 0),
       },
       items,
-      page: pageNum,
-      limit: limitNum,
+      page: 1,
+      limit: total,
       total,
-      totalPages: Math.ceil(total / limitNum) || 0,
+      totalPages: 1,
     });
   } catch (error) {
     next(error);
@@ -265,8 +265,6 @@ exports.getRiderSettlementsAdmin = async (req, res, next) => {
       ];
     }
 
-    const pageNum = Math.max(1, Number(page) || 1);
-    const limitNum = Math.min(100, Math.max(1, Number(limit) || 20));
     const orderDir = sortOrder === 'asc' ? 'asc' : 'desc';
 
     const [total, orders] = await Promise.all([
@@ -278,8 +276,6 @@ exports.getRiderSettlementsAdmin = async (req, res, next) => {
           financialTransaction: true,
         },
         orderBy: { createdAt: orderDir },
-        skip: (pageNum - 1) * limitNum,
-        take: limitNum,
       }),
     ]);
 

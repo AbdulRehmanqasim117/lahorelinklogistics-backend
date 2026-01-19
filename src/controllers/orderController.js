@@ -842,6 +842,33 @@ const updateStatus = async (req, res, next) => {
       amountToSet = !Number.isNaN(parsed) && parsed >= 0 ? parsed : existing.codAmount;
       data.deliveredAt = new Date();
       data.amountCollected = amountToSet;
+
+      try {
+        const commissionConfig = await prisma.commissionConfig.findUnique({
+          where: { shipperId: existing.shipperId },
+          include: { weightBrackets: true },
+        });
+
+        if (commissionConfig) {
+          const numericWeight = Number(existing.weightKg || 0);
+          if (Number.isFinite(numericWeight) && numericWeight > 0) {
+            const { serviceCharges, rule } = computeServiceChargeKgBased(
+              numericWeight,
+              commissionConfig,
+            );
+
+            if (rule && Number.isFinite(serviceCharges) && serviceCharges >= 0) {
+              data.serviceCharges = serviceCharges;
+            }
+          }
+        }
+      } catch (scErr) {
+        console.error(
+          'Error recalculating service charges on delivery for order',
+          orderId,
+          scErr,
+        );
+      }
     } else if (status === 'FAILED' || status === 'RETURNED') {
       data.failedReason = reason;
     }

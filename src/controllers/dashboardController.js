@@ -57,7 +57,10 @@ exports.getManagerDashboard = async (req, res, next) => {
       );
 
     const totalServiceCharges = orders
-      .filter((o) => o.status === 'DELIVERED')
+      .filter((o) => {
+        const status = String(o.status || '').toUpperCase();
+        return ['DELIVERED', 'RETURNED', 'FAILED'].includes(status);
+      })
       .reduce((sum, o) => sum + Number(o.serviceCharges ?? 0), 0);
 
     const warehouseOrdersCount = await prisma.order.count({
@@ -140,7 +143,10 @@ exports.getCeoDashboard = async (req, res, next) => {
       );
 
     const totalServiceCharges = orders
-      .filter((o) => o.status === 'DELIVERED')
+      .filter((o) => {
+        const status = String(o.status || '').toUpperCase();
+        return ['DELIVERED', 'RETURNED', 'FAILED'].includes(status);
+      })
       .reduce((sum, o) => sum + Number(o.serviceCharges ?? 0), 0);
 
     const [totalShippers, totalRiders, warehouseOrdersCount] = await Promise.all([
