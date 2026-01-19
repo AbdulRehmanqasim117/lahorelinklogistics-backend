@@ -357,8 +357,10 @@ const ceoEditOrder = async (req, res, next) => {
     const rawUserId = req.user && (req.user.id || req.user._id);
     const editedById = Number(rawUserId);
 
-    if (role !== 'CEO') {
-      return res.status(403).json({ message: 'Only CEO can edit orders' });
+    if (role !== 'CEO' && role !== 'MANAGER') {
+      return res
+        .status(403)
+        .json({ message: 'Only CEO or Manager can edit orders' });
     }
     if (!Number.isInteger(editedById) || editedById <= 0) {
       return res.status(401).json({ message: 'Unauthorized' });
