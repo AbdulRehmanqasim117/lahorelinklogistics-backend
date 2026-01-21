@@ -949,6 +949,8 @@ const getLabel = async (req, res, next) => {
             id: true,
             name: true,
             companyName: true,
+            phone: true,
+            contactNumber: true,
             businessAddress: true,
             pickupAddress: true,
           },
@@ -991,6 +993,10 @@ const getLabel = async (req, res, next) => {
       shipper: {
         name: order.shipper?.name || 'N/A',
         companyName: order.shipper?.companyName || 'N/A',
+        phone:
+          order.shipper?.phone ||
+          order.shipper?.contactNumber ||
+          null,
         address:
           order.shipper?.businessAddress ||
           order.shipper?.pickupAddress ||
@@ -1041,6 +1047,8 @@ const getLabels = async (req, res, next) => {
             id: true,
             name: true,
             companyName: true,
+            phone: true,
+            contactNumber: true,
             businessAddress: true,
             pickupAddress: true,
           },
@@ -1083,6 +1091,10 @@ const getLabels = async (req, res, next) => {
         shipper: {
           name: order.shipper?.name || 'N/A',
           companyName: order.shipper?.companyName || 'N/A',
+          phone:
+            order.shipper?.phone ||
+            order.shipper?.contactNumber ||
+            null,
           address:
             order.shipper?.businessAddress ||
             order.shipper?.pickupAddress ||
