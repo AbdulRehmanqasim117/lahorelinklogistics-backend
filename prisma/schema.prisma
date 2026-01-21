@@ -114,6 +114,7 @@ model User {
 
   // Shipper fields
   companyName         String?
+  businessAddress     String?
   cnicNumber          String?
   contactNumber       String?
   emergencyContact    String?

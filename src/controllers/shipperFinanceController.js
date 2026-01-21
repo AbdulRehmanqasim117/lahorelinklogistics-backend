@@ -90,7 +90,11 @@ exports.getMyFinanceSummary = async (req, res, next) => {
           companyName: user.companyName || profile?.companyName || null,
           phone: user.phone || user.contactNumber || null,
           email: user.email,
-          address: user.pickupAddress || profile?.address || null,
+          address:
+            user.businessAddress ||
+            user.pickupAddress ||
+            profile?.address ||
+            null,
           cnic: user.cnic || user.cnicNumber || null,
           iban: user.iban || null,
           bankName: user.bankName || null,

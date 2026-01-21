@@ -944,7 +944,15 @@ const getLabel = async (req, res, next) => {
     const order = await prisma.order.findUnique({
       where: { id: orderId },
       include: {
-        shipper: { select: { id: true, name: true, companyName: true } },
+        shipper: {
+          select: {
+            id: true,
+            name: true,
+            companyName: true,
+            businessAddress: true,
+            pickupAddress: true,
+          },
+        },
       },
     });
 
@@ -982,6 +990,11 @@ const getLabel = async (req, res, next) => {
       shipper: {
         name: order.shipper?.name || 'N/A',
         companyName: order.shipper?.companyName || 'N/A',
+        address:
+          order.shipper?.businessAddress ||
+          order.shipper?.pickupAddress ||
+          order.shipper?.companyName ||
+          null,
         serviceType: order.serviceType,
       },
       order: {
@@ -1017,7 +1030,17 @@ const getLabels = async (req, res, next) => {
 
     const orders = await prisma.order.findMany({
       where: { id: { in: idList } },
-      include: { shipper: { select: { id: true, name: true, companyName: true } } },
+      include: {
+        shipper: {
+          select: {
+            id: true,
+            name: true,
+            companyName: true,
+            businessAddress: true,
+            pickupAddress: true,
+          },
+        },
+      },
     });
 
     if (!orders || orders.length === 0) {
@@ -1054,6 +1077,11 @@ const getLabels = async (req, res, next) => {
         shipper: {
           name: order.shipper?.name || 'N/A',
           companyName: order.shipper?.companyName || 'N/A',
+          address:
+            order.shipper?.businessAddress ||
+            order.shipper?.pickupAddress ||
+            order.shipper?.companyName ||
+            null,
           serviceType: order.serviceType,
         },
         order: {
@@ -1085,7 +1113,17 @@ const printLabelsHtml = async (req, res, next) => {
 
     const orders = await prisma.order.findMany({
       where: { id: { in: ids }, shipperId },
-      include: { shipper: { select: { name: true, companyName: true, phone: true, pickupAddress: true } } },
+      include: {
+        shipper: {
+          select: {
+            name: true,
+            companyName: true,
+            phone: true,
+            businessAddress: true,
+            pickupAddress: true,
+          },
+        },
+      },
     });
     if (!orders.length) return res.status(404).send('Orders not found');
 
@@ -1116,7 +1154,11 @@ const printLabelsHtml = async (req, res, next) => {
       const orderBarcode = barcodeSvg(String(displayOrderNumber || '').replace(/[^0-9]/g, ''));
       const codBarcode = barcodeSvg(String(finalAmount).replace(/[^0-9]/g, ''));
       const shipperName = o.shipper?.name || 'N/A';
-      const shipperAddress = o.shipper?.address || o.shipper?.companyName || 'N/A';
+      const shipperAddress =
+        o.shipper?.businessAddress ||
+        o.shipper?.pickupAddress ||
+        o.shipper?.companyName ||
+        'N/A';
       const shipperPhone = o.shipper?.phone || 'N/A';
       const service = o.paymentType || o.serviceType || 'COD';
       const weightVal = o.weight || '0.5 KG';

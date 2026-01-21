@@ -68,6 +68,7 @@ exports.createUser = async (req, res, next) => {
       role,
       // Shipper business fields on User
       companyName: role === 'SHIPPER' ? companyName : undefined,
+      businessAddress: role === 'SHIPPER' ? (address || pickupAddress) : undefined,
       cnicNumber: role === 'SHIPPER' ? cnicNumber : undefined,
       contactNumber: role === 'SHIPPER' ? (contactNumber || phone) : undefined,
       emergencyContact: role === 'SHIPPER' ? emergencyContact : undefined,

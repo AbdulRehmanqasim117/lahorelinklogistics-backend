@@ -72,6 +72,7 @@ exports.signup = async (req, res, next) => {
     const { 
       name, email, password, role,
       companyName,
+      businessAddress,
       cnicNumber,
       contactNumber,
       emergencyContact,
@@ -105,6 +106,7 @@ exports.signup = async (req, res, next) => {
     if (role === 'SHIPPER') {
       // Save shipper business fields
       payload.companyName = companyName || '';
+      payload.businessAddress = businessAddress || '';
       // Prefer explicit CNIC, but keep legacy cnicNumber
       payload.cnicNumber = cnicNumber || cnic || '';
       payload.cnic = cnic || cnicNumber || '';
