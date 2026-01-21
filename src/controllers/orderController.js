@@ -976,7 +976,7 @@ const getLabel = async (req, res, next) => {
     const displayOrderNumber = externalOrderNumber || order.bookingId;
 
     const labelData = {
-      _debugLabelVersion: 'v2-address',
+      _debugLabelVersion: 'v3-weight',
       bookingId: order.bookingId,
       trackingId: order.trackingId,
       isIntegrated,
@@ -1008,6 +1008,10 @@ const getLabel = async (req, res, next) => {
         createdAt: order.createdAt,
         isIntegrated,
         shopifyOrderNumber: externalOrderNumber,
+        // expose weight for labels (kg units)
+        weightKg: order.weightKg,
+        // legacy alias if any client still reads `weight`
+        weight: order.weightKg,
       },
     };
 
@@ -1064,7 +1068,7 @@ const getLabels = async (req, res, next) => {
       const displayOrderNumber = externalOrderNumber || order.bookingId;
 
       return {
-        _debugLabelVersion: 'v2-address',
+        _debugLabelVersion: 'v3-weight',
         bookingId: order.bookingId,
         trackingId: order.trackingId,
         isIntegrated,
@@ -1096,6 +1100,10 @@ const getLabels = async (req, res, next) => {
           createdAt: order.createdAt,
           isIntegrated,
           shopifyOrderNumber: externalOrderNumber,
+          // expose weight for labels (kg units)
+          weightKg: order.weightKg,
+          // legacy alias if any client still reads `weight`
+          weight: order.weightKg,
         },
       };
     });
@@ -1163,7 +1171,10 @@ const printLabelsHtml = async (req, res, next) => {
         'N/A';
       const shipperPhone = o.shipper?.phone || 'N/A';
       const service = o.paymentType || o.serviceType || 'COD';
-      const weightVal = o.weight || '0.5 KG';
+      const weightVal =
+        typeof o.weightKg === 'number' && o.weightKg > 0
+          ? `${o.weightKg} KG`
+          : '0.5 KG';
       const fragileVal = o.fragile ? 'true' : 'false';
       const piecesVal = o.pieces || 1;
       const rawRemarks = (o.remarks || '').trim();
