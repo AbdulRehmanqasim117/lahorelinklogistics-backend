@@ -976,6 +976,7 @@ const getLabel = async (req, res, next) => {
     const displayOrderNumber = externalOrderNumber || order.bookingId;
 
     const labelData = {
+      _debugLabelVersion: 'v2-address',
       bookingId: order.bookingId,
       trackingId: order.trackingId,
       isIntegrated,
@@ -1063,6 +1064,7 @@ const getLabels = async (req, res, next) => {
       const displayOrderNumber = externalOrderNumber || order.bookingId;
 
       return {
+        _debugLabelVersion: 'v2-address',
         bookingId: order.bookingId,
         trackingId: order.trackingId,
         isIntegrated,
