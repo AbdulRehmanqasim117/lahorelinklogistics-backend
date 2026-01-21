@@ -1163,7 +1163,8 @@ const printLabelsHtml = async (req, res, next) => {
       const trackingBarcode = barcodeSvg(String(o.trackingId || '').replace(/[^0-9]/g, ''));
       const orderBarcode = barcodeSvg(String(displayOrderNumber || '').replace(/[^0-9]/g, ''));
       const codBarcode = barcodeSvg(String(finalAmount).replace(/[^0-9]/g, ''));
-      const shipperName = o.shipper?.name || 'N/A';
+      // Brand line should always show company/brand name, not personal name
+      const shipperName = o.shipper?.companyName || 'N/A';
       const shipperAddress =
         o.shipper?.businessAddress ||
         o.shipper?.pickupAddress ||
