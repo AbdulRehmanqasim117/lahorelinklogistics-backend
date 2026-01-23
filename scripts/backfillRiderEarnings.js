@@ -50,9 +50,13 @@ const run = async () => {
 
           const rule = normalizedRules.find((r) => r._normalizedStatus === normalizedStatus);
 
+          // Track whether the applied rider commission rule was percentage-based
+          let riderCommissionUsesPercentage = false;
+
           const applyRule = (type, value, codBase) => {
             const numericValue = Number(value || 0);
             if (type === 'PERCENTAGE') {
+              riderCommissionUsesPercentage = true;
               return (Number(codBase || 0) * numericValue) / 100;
             }
             return numericValue;
@@ -71,8 +75,9 @@ const run = async () => {
             riderEarning = applyRule(riderCfg.type, riderCfg.value, codBase);
           }
 
-          // Clamp only for delivered orders
-          if (isDelivered) {
+          // For delivered COD orders, clamp only when the commission is percentage-based.
+          // Flat PKR commissions are allowed to exceed COD for low-COD orders.
+          if (isDelivered && riderCommissionUsesPercentage) {
             const codForClamp = Number(order.amountCollected || order.codAmount || 0);
             if (codForClamp > 0 && riderEarning > codForClamp) {
               riderEarning = codForClamp;

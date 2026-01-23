@@ -691,6 +691,8 @@ const createFinancialTransaction = async (order) => {
     }
 
     let riderCommission = 0;
+    // Track whether the applied rider commission rule was percentage-based
+    let riderCommissionUsesPercentage = false;
     if (order.assignedRiderId) {
       const riderCfg = await prisma.riderCommissionConfig.findUnique({
         where: { riderId: order.assignedRiderId },
@@ -703,6 +705,7 @@ const createFinancialTransaction = async (order) => {
         const applyRule = (type, value) => {
           const numericValue = Number(value || 0);
           if (type === 'PERCENTAGE') {
+            riderCommissionUsesPercentage = true;
             return Math.round((Number(codBase || 0) * numericValue) / 100);
           }
           return numericValue;
@@ -720,8 +723,10 @@ const createFinancialTransaction = async (order) => {
       }
     }
 
-    // For delivered COD orders, do not allow rider commission to exceed collected COD.
-    if (isDelivered) {
+    // For delivered COD orders, do not allow rider commission to exceed collected COD
+    // when the commission is percentage-based. Flat PKR commissions are allowed to
+    // exceed COD for low-COD orders when that is what the config specifies.
+    if (isDelivered && riderCommissionUsesPercentage) {
       const codForClamp = codCollected;
       if (codForClamp > 0 && riderCommission > codForClamp) {
         riderCommission = codForClamp;
