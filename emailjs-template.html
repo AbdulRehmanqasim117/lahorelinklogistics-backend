@@ -1,0 +1,39 @@
+<div style="font-family: system-ui, sans-serif, Arial; font-size: 12px">
+  <div>A password reset request for LahoreLink Logistics has been received. Use the code below to reset your password.</div>
+  <div
+    style="
+      margin-top: 20px;
+      padding: 15px 0;
+      border-width: 1px 0;
+      border-style: dashed;
+      border-color: lightgrey;
+    "
+  >
+    <table role="presentation">
+      <tr>
+        <td style="vertical-align: top">
+          <div
+            style="
+              padding: 6px 10px;
+              margin: 0 10px;
+              background-color: aliceblue;
+              border-radius: 5px;
+              font-size: 26px;
+            "
+            role="img"
+          >
+            🔐
+          </div>
+        </td>
+        <td style="vertical-align: top">
+          <div style="color: #2c3e50; font-size: 16px">
+            <strong>{{to_name}}</strong>
+          </div>
+          <div style="color: #cccccc; font-size: 13px">{{from_name}} - Password Reset</div>
+          <p style="font-size: 16px">Your verification code is: <strong style="font-size: 20px; letter-spacing: 2px;">{{reset_code}}</strong></p>
+          <p style="font-size: 14px; color: #666;">This code is valid for 10 minutes. If you didn't request this, please ignore this email.</p>
+        </td>
+      </tr>
+    </table>
+  </div>
+</div>

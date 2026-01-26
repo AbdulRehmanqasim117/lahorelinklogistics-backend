@@ -1,4 +1,4 @@
-const nodemailer = require('nodemailer');
+const https = require('https');
 const CLIENT_URL =
   (process.env.FRONTEND_URL || process.env.CLIENT_URL || 'https://lahorelinklogistics.com')
     .replace(/\/$/, '');
@@ -13,156 +13,119 @@ const CLIENT_URL =
 // FROM_NAME=LahoreLink Logistics
 // FROM_EMAIL=your_gmail@example.com
 
-const getSmtpConfig = () => {
-  const host = process.env.SMTP_HOST || 'smtp.gmail.com';
-  const port = Number(process.env.SMTP_PORT || 465);
-  const secure = process.env.SMTP_SECURE
-    ? process.env.SMTP_SECURE === 'true'
-    : port === 465;
+const getEmailJsConfig = () => {
+  const serviceId = process.env.EMAILJS_SERVICE_ID;
+  const templateId = process.env.EMAILJS_TEMPLATE_ID_RESET;
+  const publicKey = process.env.EMAILJS_PUBLIC_KEY;
+  const privateKey = process.env.EMAILJS_PRIVATE_KEY;
 
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-
-  if (!user || !pass) {
-    console.warn(
-      '[MAILER] SMTP_USER or SMTP_PASS not set. Email sending is disabled.'
-    );
-  }
-
-  return {
-    host,
-    port,
-    secure,
-    auth: user && pass ? { user, pass } : null,
-  };
-};
-
-let transporter = null;
-
-function getTransporter() {
-  if (transporter) return transporter;
-
-  const config = getSmtpConfig();
-
-  if (!config.auth) {
-    transporter = null;
+  if (!serviceId || !templateId || !publicKey) {
+    console.warn('[MAILER] EmailJS is not fully configured. Email sending is disabled.', {
+      hasServiceId: !!serviceId,
+      hasTemplateId: !!templateId,
+      hasPublicKey: !!publicKey,
+    });
     return null;
   }
 
-  transporter = nodemailer.createTransport({
-    host: config.host,
-    port: config.port,
-    secure: config.secure,
-    auth: config.auth,
+  return {
+    serviceId,
+    templateId,
+    publicKey,
+    privateKey,
+  };
+};
+
+function sendWithEmailJs({ to, name, code }) {
+  const config = getEmailJsConfig();
+  if (!config) {
+    return null;
+  }
+
+  const fromName = process.env.FROM_NAME || 'LahoreLink Logistics';
+  const fromEmail = process.env.FROM_EMAIL || 'no-reply@lahorelinklogistics.com';
+
+  const payload = JSON.stringify({
+    service_id: config.serviceId,
+    template_id: config.templateId,
+    user_id: config.publicKey,
+    accessToken: config.privateKey,
+    template_params: {
+      to_email: to,
+      to_name: name || 'User',
+      reset_code: code,
+      from_name: fromName,
+      from_email: fromEmail,
+    },
   });
 
-  // Verify connection on startup and log result
-  transporter
-    .verify()
-    .then(() => {
-      console.log(
-        `[MAILER] SMTP connection verified (${config.host}:${config.port}, secure=${config.secure})`
-      );
-    })
-    .catch((error) => {
-      console.error('[MAILER] SMTP verification failed:', {
-        message: error.message,
-        code: error.code,
-        response: error.response,
+  const options = {
+    hostname: 'api.emailjs.com',
+    path: '/api/v1.0/email/send',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload),
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', (chunk) => {
+        body += chunk;
+      });
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ statusCode: res.statusCode, body });
+        } else {
+          reject(
+            new Error(
+              `EmailJS request failed with status ${res.statusCode}: ${body}`
+            )
+          );
+        }
       });
     });
 
-  return transporter;
+    req.on('error', (err) => {
+      reject(err);
+    });
+
+    req.write(payload);
+    req.end();
+  });
 }
 
 async function sendResetEmail(email, code, name) {
-  const tx = getTransporter();
-
-  if (!tx) {
-    console.error(
-      '[MAILER] sendResetEmail called but transporter is not configured.'
-    );
-    throw new Error('Email service is not configured on the server');
-  }
-
   try {
-    const fromEmail = process.env.FROM_EMAIL || process.env.SMTP_USER;
-    const fromName = process.env.FROM_NAME || 'LahoreLink Logistics';
-    const from = fromEmail ? `"${fromName}" <${fromEmail}>` : undefined;
+    if (!getEmailJsConfig()) {
+      console.error(
+        '[MAILER] sendResetEmail called but EmailJS is not configured.'
+      );
+      throw new Error('Email service is not configured on the server');
+    }
 
-    const subject = 'LahoreLink - Password Reset Code';
-
-    const html = `
-      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px;">
-          <h2 style="color: #2c3e50;">Password Reset Request</h2>
-          <p>Hello ${name || 'User'},</p>
-          <p>We received a request to reset your password. Use the following verification code:</p>
-          
-          <div style="text-align: center; margin: 30px 0; background: #fff; padding: 20px; border-radius: 5px; border: 1px dashed #ccc;">
-            <div style="font-size: 24px; font-weight: bold; letter-spacing: 5px; color: #2c3e50;">
-              ${code}
-            </div>
-            <div style="margin-top: 10px; font-size: 12px; color: #7f8c8d;">
-              (This code is valid for 10 minutes)
-            </div>
-          </div>
-          
-          <p>Enter this code in the password reset form to proceed. If you didn't request this, please ignore this email.</p>
-          
-          <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 20px 0;">
-          <p style="font-size: 12px; color: #7f8c8d;">
-            This is an automated message, please do not reply to this email.
-          </p>
-        </div>
-      </div>
-    `;
-
-    // Plain text version for email clients that don't support HTML
-    const text = `
-      Hello ${name || 'User'},
-
-      Your password reset code is: ${code}
-      
-      Enter this code in the password reset form to proceed.
-      
-      This code is valid for 10 minutes.
-      
-      If you didn't request this, please ignore this email.
-    `;
-
-    const mailOptions = {
-      from,
+    console.log('[MAILER] Sending password reset email via EmailJS', {
       to: email,
-      subject,
-      html,
-      text,
-    };
+    });
 
-    console.log('[MAILER] Sending password reset email', { to: email });
+    const info = await sendWithEmailJs({ to: email, name, code });
 
-    const info = await tx.sendMail(mailOptions);
-
-    console.log('[MAILER] Password reset email sent', {
+    console.log('[MAILER] Password reset email sent via EmailJS', {
       to: email,
-      messageId: info.messageId,
-      response: info.response,
+      info,
     });
 
     return info;
   } catch (error) {
-    console.error('❌ Error sending password reset email:', error);
+    console.error('❌ Error sending password reset email via EmailJS:', error);
     console.error('Error details:', {
       message: error.message,
       stack: error.stack,
-      code: error.code,
-      response: error.response,
     });
     throw new Error('Failed to send password reset email: ' + error.message);
   }
 }
-
-// Initialize transporter on module load so that verify() runs on startup
-getTransporter();
 
 module.exports = { sendResetEmail };
