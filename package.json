@@ -9,7 +9,7 @@
   "prisma:migrate": "prisma migrate dev --name init_mysql",
   "prisma:generate": "node node_modules/prisma/build/index.js generate",
   "prisma:deploy": "node node_modules/prisma/build/index.js migrate deploy",
-  "build": "npm run prisma:generate",
+  "build": "npm run prisma:generate && mkdir -p dist && echo 'build complete' > dist/build.txt",
   "seed": "node prisma/seed.js",
   "postinstall": "npm run prisma:generate && npm run prisma:deploy && npm run seed"
 },
@@ -25,7 +25,6 @@
     "joi": "^17.13.3",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.2",
-    "nodemailer": "^7.0.11",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
