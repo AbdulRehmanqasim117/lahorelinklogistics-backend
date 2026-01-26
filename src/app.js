@@ -1,13 +1,15 @@
+const path = require("path");
+
+// Load env variables as early as possible so that Prisma and other modules
+// see the correct configuration (e.g. DATABASE_URL) during initialization.
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
+
 const express = require("express");
 const cors = require("cors");
 const connectDB = require("./config/db");
 const errorHandler = require("./middleware/errorHandler");
-const path = require("path");
 const webhookRoutes = require("./routes/webhookRoutes");
 const prisma = require("./prismaClient");
-
-// Load env variables
-require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const NODE_ENV = process.env.NODE_ENV || "development";
 const FRONTEND_URL = (process.env.FRONTEND_URL || "").trim();
