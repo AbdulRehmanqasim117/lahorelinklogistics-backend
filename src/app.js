@@ -37,7 +37,8 @@ const dbReady = connectDB();
 const app = express();
 
 // Middleware
-// CORS: in production, allow only the configured FRONTEND_URL; in development, reflect the request origin.
+// CORS: in production, allow only the configured FRONTEND_URL and known domains.
+// Temporarily log rejected origins to help diagnose "Failed to fetch" issues.
 const corsOptions = {
   origin:
     NODE_ENV === "production"
@@ -45,16 +46,20 @@ const corsOptions = {
           if (!origin) {
             return callback(null, true);
           }
+
           if (
             ALLOWED_PROD_ORIGINS.includes(origin) ||
             DEV_LOCALHOST_ORIGINS.includes(origin)
           ) {
             return callback(null, true);
           }
+
+          console.error("CORS blocked origin:", origin);
           return callback(new Error("Not allowed by CORS"));
         }
       : true,
-  credentials: process.env.CORS_ALLOW_CREDENTIALS === "true",
+  // Always allow credentials for approved origins so that cookies/JWTs work cross-site.
+  credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: [
     "Content-Type",
