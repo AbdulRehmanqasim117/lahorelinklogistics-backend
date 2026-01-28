@@ -1,22 +1,51 @@
 const app = require('./src/app');
-const http = require('http');
 
-const basePort = parseInt(process.env.PORT || '5000', 10);
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const PORT = parseInt(process.env.PORT, 10) || 5000;
 
-const startServer = (port, attemptsLeft = 5) => {
-  const server = http.createServer(app);
-  server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE' && attemptsLeft > 0) {
-      const next = port + 1;
-      console.warn(`Port ${port} in use, trying ${next}...`);
-      startServer(next, attemptsLeft - 1);
-    } else {
-      console.error('Server error:', err.message);
-    }
-  });
-  server.listen(port, () => {
-    console.log(`Server running on port ${port}`);
-  });
-};
+// Global process-level error handlers so that unexpected errors don't crash
+// the process without at least being logged in a structured way.
+process.on('unhandledRejection', (reason, promise) => {
+  console.error(
+    JSON.stringify({
+      level: 'error',
+      type: 'unhandledRejection',
+      message: reason && reason.message ? reason.message : String(reason),
+      stack: reason && reason.stack ? reason.stack : undefined,
+    })
+  );
+});
 
-startServer(basePort);
+process.on('uncaughtException', (error) => {
+  console.error(
+    JSON.stringify({
+      level: 'error',
+      type: 'uncaughtException',
+      message: error.message,
+      stack: error.stack,
+    })
+  );
+});
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(
+    JSON.stringify({
+      level: 'info',
+      message: 'Server started',
+      port: PORT,
+      env: NODE_ENV,
+    })
+  );
+});
+
+server.on('error', (err) => {
+  console.error(
+    JSON.stringify({
+      level: 'error',
+      type: 'serverError',
+      message: err.message,
+      code: err.code,
+      stack: err.stack,
+    })
+  );
+});

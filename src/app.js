@@ -9,10 +9,35 @@ const cors = require("cors");
 const connectDB = require("./config/db");
 const errorHandler = require("./middleware/errorHandler");
 const webhookRoutes = require("./routes/webhookRoutes");
-const prisma = require("./prismaClient");
 
 const NODE_ENV = process.env.NODE_ENV || "development";
 const FRONTEND_URL = (process.env.FRONTEND_URL || "").trim();
+
+const REQUIRED_ENV_VARS = ["DATABASE_URL", "JWT_SECRET"];
+
+const validateRequiredEnv = () => {
+  const missing = REQUIRED_ENV_VARS.filter((name) => {
+    const value = process.env[name];
+    return !value || !String(value).trim();
+  });
+
+  if (missing.length > 0) {
+    // Critical configuration is missing; log clearly and exit instead of
+    // throwing cryptic errors later during request handling.
+    // eslint-disable-next-line no-console
+    console.error(
+      JSON.stringify({
+        level: "error",
+        type: "config",
+        message: "Missing required environment variables",
+        missing,
+      })
+    );
+    process.exit(1);
+  }
+};
+
+validateRequiredEnv();
 
 const ALLOWED_PROD_ORIGINS = [
   "https://lahorelinklogistics.com",
@@ -72,6 +97,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 // Webhooks (need raw body for HMAC verification) must be mounted before
 // global JSON body parser.
@@ -97,14 +123,8 @@ app.use("/api/notifications", require("./routes/notificationRoutes"));
 app.use("/api/company-profile", require("./routes/companyProfileRoutes"));
 app.use("/api/setup", require("./routes/setupRoutes"));
 
-app.get("/health", async (req, res) => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    res.json({ status: "ok" });
-  } catch (err) {
-    console.error("Health check DB error", err);
-    res.status(500).json({ status: "error" });
-  }
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true, ts: Date.now() });
 });
 
 // Error Handler
