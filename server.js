@@ -1,11 +1,16 @@
 const app = require('./src/app');
 
-const NODE_ENV = process.env.NODE_ENV || 'development';
-const PORT = Number(process.env.PORT);
-if (!PORT) {
-  console.error("PORT is not set by the hosting environment");
-  process.exit(1);
-}
+const NODE_ENV = process.env.NODE_ENV || 'production';
+const PORT = parseInt(process.env.PORT || '5000', 10);
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(JSON.stringify({
+    level: 'info',
+    message: 'Server started',
+    port: PORT,
+    env: NODE_ENV,
+  }));
+});
 
 // Global process-level error handlers so that unexpected errors don't crash
 // the process without at least being logged in a structured way.
@@ -27,17 +32,6 @@ process.on('uncaughtException', (error) => {
       type: 'uncaughtException',
       message: error.message,
       stack: error.stack,
-    })
-  );
-});
-
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(
-    JSON.stringify({
-      level: 'info',
-      message: 'Server started',
-      port: PORT,
-      env: NODE_ENV,
     })
   );
 });
