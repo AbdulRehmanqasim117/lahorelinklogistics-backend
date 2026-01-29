@@ -1,4 +1,5 @@
 const https = require('https');
+const nodemailer = require('nodemailer');
 const CLIENT_URL =
   (process.env.FRONTEND_URL || process.env.CLIENT_URL || 'https://lahorelinklogistics.com')
     .replace(/\/$/, '');
@@ -99,27 +100,68 @@ function sendWithEmailJs({ to, name, code }) {
 
 async function sendResetEmail(email, code, name) {
   try {
-    if (!getEmailJsConfig()) {
+    const host = process.env.SMTP_HOST;
+    const port = process.env.SMTP_PORT;
+    const user = process.env.SMTP_USER;
+    const pass = process.env.SMTP_PASS;
+
+    if (!host || !port || !user || !pass) {
       console.error(
-        '[MAILER] sendResetEmail called but EmailJS is not configured.'
+        '[MAILER] sendResetEmail called but SMTP is not fully configured.',
+        {
+          hasHost: !!host,
+          hasPort: !!port,
+          hasUser: !!user,
+          hasPass: !!pass,
+        }
       );
-      throw new Error('Email service is not configured on the server');
+      throw new Error('SMTP email service is not configured on the server');
     }
 
-    console.log('[MAILER] Sending password reset email via EmailJS', {
-      to: email,
+    const fromName = process.env.FROM_NAME || 'LahoreLink Logistics';
+    const fromEmail = process.env.FROM_EMAIL || user;
+
+    const secure =
+      String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' ||
+      String(port) === '465';
+
+    const transporter = nodemailer.createTransport({
+      host,
+      port: Number(port),
+      secure,
+      auth: {
+        user,
+        pass,
+      },
     });
 
-    const info = await sendWithEmailJs({ to: email, name, code });
-
-    console.log('[MAILER] Password reset email sent via EmailJS', {
+    console.log('[MAILER] Sending password reset email via SMTP', {
       to: email,
-      info,
+      host,
+      port: Number(port),
+      secure,
+    });
+
+    const info = await transporter.sendMail({
+      from: `"${fromName}" <${fromEmail}>`,
+      to: email,
+      subject: 'LahoreLink Logistics - Password Reset Code',
+      text: `Your LahoreLink Logistics verification code is ${code}. This code will expire in 10 minutes.`,
+      html: `<p>Hi ${name || 'User'},</p>
+<p>Your LahoreLink Logistics password reset verification code is:</p>
+<h2>${code}</h2>
+<p>This code will expire in 10 minutes.</p>
+<p>If you did not request this, you can safely ignore this email.</p>`,
+    });
+
+    console.log('[MAILER] Password reset email sent via SMTP', {
+      to: email,
+      messageId: info.messageId,
     });
 
     return info;
   } catch (error) {
-    console.error('❌ Error sending password reset email via EmailJS:', error);
+    console.error('❌ Error sending password reset email via SMTP:', error);
     console.error('Error details:', {
       message: error.message,
       stack: error.stack,

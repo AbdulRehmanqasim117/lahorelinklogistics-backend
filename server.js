@@ -1,7 +1,11 @@
 const app = require('./src/app');
 
 const NODE_ENV = process.env.NODE_ENV || 'development';
-const PORT = parseInt(process.env.PORT, 10) || 5000;
+const PORT = Number(process.env.PORT);
+if (!PORT) {
+  console.error("PORT is not set by the hosting environment");
+  process.exit(1);
+}
 
 // Global process-level error handlers so that unexpected errors don't crash
 // the process without at least being logged in a structured way.
