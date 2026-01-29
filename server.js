@@ -1,9 +1,10 @@
 const app = require('./src/app');
 
-const PORT = process.env.PORT || 3000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const PORT = Number(process.env.PORT || 5000);
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(JSON.stringify({ level: 'info', message: 'Server started', port: PORT, env: NODE_ENV }));
 });
 // Global process-level error handlers so that unexpected errors don't crash
 // the process without at least being logged in a structured way.
