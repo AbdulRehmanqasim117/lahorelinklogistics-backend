@@ -89,10 +89,14 @@ exports.signup = async (req, res, next) => {
       // Rider-specific fields
       vehicleType,
       vehicleNumber,
-      vehicleModel
+      vehicleModel,
+      acceptedTerms
     } = req.body;
     if (!name || !email || !password || !role) {
       return res.status(400).json({ message: 'Missing required fields' });
+    }
+    if (!acceptedTerms) {
+      return res.status(400).json({ message: 'You must agree to the Standard Terms and Conditions of Carriage.' });
     }
     if (!['SHIPPER', 'RIDER'].includes(role)) {
       return res.status(403).json({ message: 'Only Shipper or Rider can sign up' });
