@@ -15,6 +15,7 @@ router.get('/summary/shipper', financeController.getShipperSummary);
 router.get('/summary/rider', financeController.getRiderSummary);
 router.get('/company/summary', financeController.getCompanyFinanceSummary);
 router.get('/company/ledger', financeController.getCompanyLedger);
+router.get('/company/ledger/export.xlsx', financeController.exportCompanyLedgerToExcel);
 router.post('/company/close-month', financeController.closeCurrentFinanceMonth);
 router.patch('/transactions/:id/settle', financeController.settleTransaction);
 // Allow authenticated; controller enforces role-based access to specific transaction

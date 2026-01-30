@@ -1,4 +1,5 @@
 const prisma = require('../prismaClient');
+const ExcelJS = require('exceljs');
 
 async function getOrCreateActiveFinancePeriod(userId) {
   let period = await prisma.financePeriod.findFirst({
@@ -155,6 +156,122 @@ function buildPrismaOrderWhere(filters) {
   }
 
   return where;
+}
+
+async function fetchCompanyLedgerData(filters, userId) {
+  const where = buildPrismaOrderWhere(filters);
+
+  const activePeriod = await getOrCreateActiveFinancePeriod(userId);
+
+  const hasExplicitRange =
+    filters.dateRange && (filters.dateRange.start || filters.dateRange.end);
+
+  console.log('DEBUG fetchCompanyLedgerData filters:', filters);
+  console.log('DEBUG fetchCompanyLedgerData activePeriod:', activePeriod);
+  console.log('DEBUG fetchCompanyLedgerData initial where:', where);
+
+  if (!hasExplicitRange && activePeriod && activePeriod.periodStart) {
+    const end = activePeriod.periodEnd || new Date();
+    where.createdAt = {
+      gte: activePeriod.periodStart,
+      lte: end,
+    };
+    console.log(
+      'DEBUG fetchCompanyLedgerData applying activePeriod window:',
+      where.createdAt,
+    );
+  }
+
+  const orders = await prisma.order.findMany({
+    where,
+    include: {
+      shipper: { select: { id: true, name: true, companyName: true } },
+      financialTransaction: true,
+    },
+    orderBy: [
+      { deliveredAt: 'desc' },
+      { createdAt: 'desc' },
+    ],
+  });
+
+  const rows = orders.map((o) => {
+    const tx = o.financialTransaction;
+    const effectiveStatus = String(o.status || '').toUpperCase();
+    const effectiveDate = o.deliveredAt || o.createdAt;
+
+    const codEffective =
+      o.paymentType === 'COD' && effectiveStatus === 'DELIVERED'
+        ? Number(o.amountCollected ?? o.codAmount ?? 0)
+        : 0;
+    const serviceChargesEff = Number(o.serviceCharges || 0);
+    const riderPaid = tx && tx.riderCommission ? Number(tx.riderCommission) : 0;
+    const companyCommissionEff =
+      tx && tx.companyCommission ? Number(tx.companyCommission) : 0;
+    const settlementStatusEff = String(tx?.settlementStatus || 'UNPAID').toUpperCase();
+
+    const riderPayoutPaidComponent =
+      riderPaid > 0 && ['PAID', 'SETTLED'].includes(settlementStatusEff)
+        ? riderPaid
+        : 0;
+    const riderPayoutUnpaidComponent =
+      riderPaid > 0 && ['UNPAID', 'PENDING'].includes(settlementStatusEff)
+        ? riderPaid
+        : 0;
+
+    const companyProfitPerOrder = serviceChargesEff - riderPaid;
+
+    const shipperName = o.shipper?.companyName || o.shipper?.name || '';
+
+    return {
+      id: o.id.toString(),
+      date: effectiveDate,
+      shipperId: o.shipperId,
+      shipperName,
+      bookingId: o.bookingId,
+      trackingId: o.trackingId,
+      cod: codEffective,
+      serviceCharges: serviceChargesEff,
+      riderPayout: riderPaid,
+      riderPayoutPaid: riderPayoutPaidComponent,
+      riderPayoutUnpaid: riderPayoutUnpaidComponent,
+      companyProfit: companyProfitPerOrder,
+      status: effectiveStatus,
+    };
+  });
+
+  const totals = rows.reduce(
+    (acc, row) => {
+      acc.totalCod += row.cod;
+      acc.totalServiceCharges += row.serviceCharges;
+      acc.totalRiderPayoutPaid += row.riderPayoutPaid || 0;
+      acc.totalRiderPayoutUnpaid += row.riderPayoutUnpaid || 0;
+      acc.totalCompanyProfit += row.companyProfit;
+      acc.totalOrders += 1;
+      return acc;
+    },
+    {
+      totalCod: 0,
+      totalServiceCharges: 0,
+      totalRiderPayoutPaid: 0,
+      totalRiderPayoutUnpaid: 0,
+      totalCompanyProfit: 0,
+      totalOrders: 0,
+    },
+  );
+
+  totals.totalRiderPayout =
+    totals.totalRiderPayoutPaid + totals.totalRiderPayoutUnpaid;
+  totals.codCollected = totals.totalCod;
+
+  return {
+    rows,
+    totals,
+    activePeriod,
+    debug: {
+      rawFilters: filters,
+      whereCreatedAt: where.createdAt || null,
+    },
+  };
 }
 
 exports.getShipperSummary = async (req, res, next) => {
@@ -650,134 +767,136 @@ exports.getCompanyFinanceSummary = async (req, res, next) => {
 exports.getCompanyLedger = async (req, res, next) => {
   try {
     const filters = buildOrderFiltersFromQuery(req.query);
-    const where = buildPrismaOrderWhere(filters);
+    const data = await fetchCompanyLedgerData(filters, req.user && req.user.id);
 
-    const activePeriod = await getOrCreateActiveFinancePeriod(
+    res.json(data);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Export company ledger (filtered) to Excel for CEO/Manager
+// GET /api/finance/company/ledger/export.xlsx
+exports.exportCompanyLedgerToExcel = async (req, res, next) => {
+  try {
+    const filters = buildOrderFiltersFromQuery(req.query);
+    const { rows, totals, activePeriod } = await fetchCompanyLedgerData(
+      filters,
       req.user && req.user.id,
     );
 
-    // Similar to the summary endpoint, when no explicit date range is
-    // provided we default the ledger view to the active finance
-    // period's start/end dates.
-    const hasExplicitRange =
-      filters.dateRange && (filters.dateRange.start || filters.dateRange.end);
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Company Ledger');
 
-    console.log('DEBUG getCompanyLedger filters:', filters);
-    console.log('DEBUG getCompanyLedger activePeriod:', activePeriod);
-    console.log('DEBUG getCompanyLedger initial where:', where);
+    worksheet.columns = [
+      { header: 'Date', key: 'date', width: 20 },
+      { header: 'Shipper', key: 'shipperName', width: 30 },
+      { header: 'Booking ID', key: 'bookingId', width: 18 },
+      { header: 'Tracking ID', key: 'trackingId', width: 18 },
+      { header: 'COD', key: 'cod', width: 15 },
+      { header: 'Service Charges', key: 'serviceCharges', width: 18 },
+      { header: 'Rider Payout', key: 'riderPayout', width: 18 },
+      { header: 'Company Profit', key: 'companyProfit', width: 18 },
+      { header: 'Status', key: 'status', width: 14 },
+    ];
 
-    if (!hasExplicitRange && activePeriod && activePeriod.periodStart) {
-      const end = activePeriod.periodEnd || new Date();
-      where.createdAt = {
-        gte: activePeriod.periodStart,
-        lte: end,
-      };
-      console.log(
-        'DEBUG getCompanyLedger applying activePeriod window:',
-        where.createdAt,
-      );
+    const now = new Date();
+    const safeFrom = filters.from || null;
+    const safeTo = filters.to || null;
+
+    const metaRows = [];
+    metaRows.push(['Company Ledger Report', '']);
+    metaRows.push(['Generated At', now.toISOString()]);
+
+    if (filters.range && filters.range !== 'all' && filters.range !== 'custom') {
+      metaRows.push(['Quick Range', String(filters.range)]);
     }
 
-    const orders = await prisma.order.findMany({
-      where,
-      include: {
-        shipper: { select: { id: true, name: true, companyName: true } },
-        financialTransaction: true,
-      },
-      orderBy: [
-        { deliveredAt: 'desc' },
-        { createdAt: 'desc' },
-      ],
+    if (safeFrom || safeTo) {
+      metaRows.push(['From', safeFrom || '']);
+      metaRows.push(['To', safeTo || '']);
+    } else if (activePeriod && activePeriod.periodStart) {
+      metaRows.push([
+        'Active Period',
+        `${activePeriod.periodStart.toISOString()} - ${
+          activePeriod.periodEnd ? activePeriod.periodEnd.toISOString() : 'Open'
+        }`,
+      ]);
+    }
+
+    let currentMetaRow = 1;
+    metaRows.forEach(([label, value]) => {
+      const cellLabel = worksheet.getCell(currentMetaRow, 1);
+      const cellValue = worksheet.getCell(currentMetaRow, 2);
+      cellLabel.value = label;
+      cellLabel.font = { bold: true };
+      cellValue.value = value;
+      currentMetaRow += 1;
     });
 
-    const rows = orders.map((o) => {
-      const tx = o.financialTransaction;
-      const effectiveStatus = String(o.status || '').toUpperCase();
-      const effectiveDate = o.deliveredAt || o.createdAt;
-
-      const codEffective =
-        o.paymentType === 'COD' && effectiveStatus === 'DELIVERED'
-          ? Number(o.amountCollected ?? o.codAmount ?? 0)
-          : 0;
-      const serviceChargesEff = Number(o.serviceCharges || 0);
-      const riderPaid = tx && tx.riderCommission ? Number(tx.riderCommission) : 0;
-      const companyCommissionEff = tx && tx.companyCommission ? Number(tx.companyCommission) : 0;
-      const settlementStatusEff = String(tx?.settlementStatus || 'UNPAID').toUpperCase();
-
-      const riderPayoutPaidComponent =
-        riderPaid > 0 && ['PAID', 'SETTLED'].includes(settlementStatusEff)
-          ? riderPaid
-          : 0;
-      const riderPayoutUnpaidComponent =
-        riderPaid > 0 && ['UNPAID', 'PENDING'].includes(settlementStatusEff)
-          ? riderPaid
-          : 0;
-      // For per-order view and summary cards we want to show the full
-      // rider commission as "Rider Payout", regardless of whether it
-      // has been settled yet. Paid vs unpaid is still tracked in the full
-      // totals via riderPayoutPaidComponent / riderPayoutUnpaidComponent.
-      const companyProfitPerOrder = serviceChargesEff - riderPaid;
-
-      const shipperName = o.shipper?.companyName || o.shipper?.name || '';
-
-      return {
-        id: o.id.toString(),
-        date: effectiveDate,
-        shipperId: o.shipperId,
-        shipperName,
-        bookingId: o.bookingId,
-        trackingId: o.trackingId,
-        cod: codEffective,
-        serviceCharges: serviceChargesEff,
-        // Full rider commission for this order
-        riderPayout: riderPaid,
-        // Paid/unpaid components are used only for aggregated totals
-        riderPayoutPaid: riderPayoutPaidComponent,
-        riderPayoutUnpaid: riderPayoutUnpaidComponent,
-        companyProfit: companyProfitPerOrder,
-        status: effectiveStatus,
+    const headerRowIndex = currentMetaRow + 1;
+    const headerRow = worksheet.getRow(headerRowIndex);
+    worksheet.columns.forEach((col, index) => {
+      const cell = headerRow.getCell(index + 1);
+      cell.value = col.header;
+      cell.font = { bold: true };
+      cell.alignment = { horizontal: 'center' };
+      cell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFE0E0E0' },
       };
     });
+    headerRow.commit();
 
-    const totals = rows.reduce(
-      (acc, row) => {
-        acc.totalCod += row.cod;
-        acc.totalServiceCharges += row.serviceCharges;
-        // Use the explicit paid/unpaid components for accurate
-        // aggregation, while the visible Rider Payout column shows the
-        // full rider commission per order.
-        acc.totalRiderPayoutPaid += row.riderPayoutPaid || 0;
-        acc.totalRiderPayoutUnpaid += row.riderPayoutUnpaid || 0;
-        acc.totalCompanyProfit += row.companyProfit;
-        acc.totalOrders += 1;
-        return acc;
-      },
-      {
-        totalCod: 0,
-        totalServiceCharges: 0,
-        totalRiderPayoutPaid: 0,
-        totalRiderPayoutUnpaid: 0,
-        totalCompanyProfit: 0,
-        totalOrders: 0,
-      },
+    let rowIndex = headerRowIndex + 1;
+    rows.forEach((row) => {
+      const excelRow = worksheet.getRow(rowIndex);
+      excelRow.getCell('date').value = row.date ? new Date(row.date) : null;
+      excelRow.getCell('shipperName').value = row.shipperName || '';
+      excelRow.getCell('bookingId').value = row.bookingId || '';
+      excelRow.getCell('trackingId').value = row.trackingId || '';
+      excelRow.getCell('cod').value = Number(row.cod || 0);
+      excelRow.getCell('serviceCharges').value = Number(row.serviceCharges || 0);
+      excelRow.getCell('riderPayout').value = Number(row.riderPayout || 0);
+      excelRow.getCell('companyProfit').value = Number(row.companyProfit || 0);
+      excelRow.getCell('status').value = row.status || '';
+      excelRow.commit();
+      rowIndex += 1;
+    });
+
+    const summaryStart = rowIndex + 1;
+    const summaryRows = [
+      ['Total Orders', totals.totalOrders || 0],
+      ['COD Collected (Shipper Funds)', totals.codCollected || 0],
+      ['Total Service Charges', totals.totalServiceCharges || 0],
+      ['Rider Payout (Paid)', totals.totalRiderPayoutPaid || 0],
+      ['Rider Payout (Unpaid)', totals.totalRiderPayoutUnpaid || 0],
+      ['Rider Payout (Total)', totals.totalRiderPayout || 0],
+      ['Company Profit (Total)', totals.totalCompanyProfit || 0],
+    ];
+
+    let summaryRowIndex = summaryStart;
+    summaryRows.forEach(([label, value]) => {
+      const labelCell = worksheet.getCell(summaryRowIndex, 1);
+      const valueCell = worksheet.getCell(summaryRowIndex, 2);
+      labelCell.value = label;
+      labelCell.font = { bold: true };
+      valueCell.value = value;
+      summaryRowIndex += 1;
+    });
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="Company_Ledger_${now.toISOString().slice(0, 10)}.xlsx"`,
     );
 
-    totals.totalRiderPayout =
-      totals.totalRiderPayoutPaid + totals.totalRiderPayoutUnpaid;
-    // Alias for clarity in frontend: COD is shipper funds, not revenue.
-    totals.codCollected = totals.totalCod;
-
-    res.json({
-      rows,
-      totals,
-      activePeriod,
-      // Debug info so frontend can inspect date filters / period without
-      // needing access to server console logs
-      debug: {
-        rawFilters: filters,
-        whereCreatedAt: where.createdAt || null,
-      },
-    });
+    await workbook.xlsx.write(res);
+    res.end();
   } catch (error) {
     next(error);
   }
