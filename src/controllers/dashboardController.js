@@ -43,11 +43,18 @@ exports.getManagerDashboard = async (req, res, next) => {
     const completedOrders = orders.filter((o) => o.status === 'DELIVERED').length;
     const pendingOrders = orders.filter((o) => ['CREATED', 'ASSIGNED'].includes(o.status)).length;
     const assignedOrders = orders.filter(
-      (o) => o.assignedRiderId && ['ASSIGNED', 'OUT_FOR_DELIVERY'].includes(o.status),
+      (o) =>
+        o.assignedRiderId && ['ASSIGNED', 'OUT_FOR_DELIVERY'].includes(o.status),
     ).length;
-    const unassignedOrders = orders.filter(
-      (o) => !o.assignedRiderId || o.status === 'CREATED',
-    ).length;
+    const unassignedOrders = orders.filter((o) => {
+      const hasRider = !!o.assignedRiderId;
+      // Unassigned sirf woh orders jo warehouse nahi pohnche
+      // aur jin par rider assign nahi hai ya jo CREATED state mein hain.
+      const preWarehouseStatuses = ['CREATED', 'ASSIGNED', 'OUT_FOR_DELIVERY'];
+      if (!preWarehouseStatuses.includes(o.status)) return false;
+      if (!hasRider) return true;
+      return o.status === 'CREATED';
+    }).length;
 
     const totalCod = orders
       .filter((o) => o.status === 'DELIVERED')
@@ -63,12 +70,11 @@ exports.getManagerDashboard = async (req, res, next) => {
       })
       .reduce((sum, o) => sum + Number(o.serviceCharges ?? 0), 0);
 
-    const warehouseOrdersCount = await prisma.order.count({
-      where: {
-        status: 'AT_LLL_WAREHOUSE',
-        ...visibilityWhere,
-      },
-    });
+    // At LLL Warehouse should follow the same period filter as other
+    // stats (based on createdAt range used for the orders query).
+    const warehouseOrdersCount = orders.filter(
+      (o) => o.status === 'AT_LLL_WAREHOUSE',
+    ).length;
 
     res.json({
       period,
@@ -129,11 +135,16 @@ exports.getCeoDashboard = async (req, res, next) => {
     const completedOrders = orders.filter((o) => o.status === 'DELIVERED').length;
     const pendingOrders = orders.filter((o) => ['CREATED', 'ASSIGNED'].includes(o.status)).length;
     const assignedOrders = orders.filter(
-      (o) => o.assignedRiderId && ['ASSIGNED', 'OUT_FOR_DELIVERY'].includes(o.status),
+      (o) =>
+        o.assignedRiderId && ['ASSIGNED', 'OUT_FOR_DELIVERY'].includes(o.status),
     ).length;
-    const unassignedOrders = orders.filter(
-      (o) => !o.assignedRiderId || o.status === 'CREATED',
-    ).length;
+    const unassignedOrders = orders.filter((o) => {
+      const hasRider = !!o.assignedRiderId;
+      const preWarehouseStatuses = ['CREATED', 'ASSIGNED', 'OUT_FOR_DELIVERY'];
+      if (!preWarehouseStatuses.includes(o.status)) return false;
+      if (!hasRider) return true;
+      return o.status === 'CREATED';
+    }).length;
 
     const totalCod = orders
       .filter((o) => o.status === 'DELIVERED')
@@ -149,16 +160,14 @@ exports.getCeoDashboard = async (req, res, next) => {
       })
       .reduce((sum, o) => sum + Number(o.serviceCharges ?? 0), 0);
 
-    const [totalShippers, totalRiders, warehouseOrdersCount] = await Promise.all([
+    const [totalShippers, totalRiders] = await Promise.all([
       prisma.user.count({ where: { role: 'SHIPPER' } }),
       prisma.user.count({ where: { role: 'RIDER' } }),
-      prisma.order.count({
-        where: {
-          status: 'AT_LLL_WAREHOUSE',
-          ...visibilityWhere,
-        },
-      }),
     ]);
+
+    const warehouseOrdersCount = orders.filter(
+      (o) => o.status === 'AT_LLL_WAREHOUSE',
+    ).length;
 
     res.json({
       period,
