@@ -130,16 +130,16 @@ exports.listShipperIntegratedOrders = async (req, res, next) => {
       typeof cityFilter === 'string' ? cityFilter.toLowerCase() : '';
 
     if (normalizedCityFilter === 'lahore') {
-      // Lahore filter: only cities that clearly mention Lahore (case-insensitive)
+      // Lahore filter: only cities that clearly mention "lahore"
+      // Rely on DB collation for case-insensitive behaviour.
       where = {
         ...baseWhere,
         city: {
           contains: 'lahore',
-          mode: 'insensitive',
         },
       };
     } else if (normalizedCityFilter === 'others') {
-      // Others: non-empty cities that do NOT mention Lahore
+      // Others: non-empty cities that do NOT mention "lahore"
       where = {
         ...baseWhere,
         NOT: [
@@ -148,7 +148,6 @@ exports.listShipperIntegratedOrders = async (req, res, next) => {
           {
             city: {
               contains: 'lahore',
-              mode: 'insensitive',
             },
           },
         ],
