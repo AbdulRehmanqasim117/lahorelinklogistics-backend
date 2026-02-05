@@ -1,6 +1,7 @@
 const generateBookingId = require('../config/bookingId');
 const generateTrackingId = require('../config/trackingId');
 const QRCode = require('qrcode');
+const ExcelJS = require('exceljs');
 const prisma = require('../prismaClient');
 const { computeServiceChargeKgBased } = require('../utils/serviceChargeCalculator');
 
@@ -71,6 +72,119 @@ function mapOrderToApi(order) {
   }
 
   return base;
+}
+
+// Build a Prisma "where" filter for orders export, reusing the same
+// visibility rules as the regular orders listing plus extra filters
+// (date, status, rider, shipper, search).
+function buildOrdersExportWhere(user, query) {
+  const { role, id } = user || {};
+  const {
+    from,
+    to,
+    status,
+    statusGroup,
+    riderId,
+    shipperId,
+    riderFilter,
+    shipperFilter,
+    q,
+    search,
+  } = query || {};
+
+  const where = { isDeleted: false };
+
+  const userIdNum = Number(id);
+
+  if (role === 'SHIPPER') {
+    if (Number.isInteger(userIdNum) && userIdNum > 0) {
+      where.shipperId = userIdNum;
+    }
+  } else if (role === 'RIDER') {
+    if (Number.isInteger(userIdNum) && userIdNum > 0) {
+      where.assignedRiderId = userIdNum;
+      where.bookingState = 'BOOKED';
+    }
+  } else if (['CEO', 'MANAGER'].includes(role)) {
+    where.OR = [
+      { isIntegrated: false },
+      { isIntegrated: true, bookingState: 'BOOKED' },
+    ];
+  }
+
+  // Optional explicit rider filter (CEO/Manager views)
+  const riderParam = riderId ?? riderFilter;
+  if (typeof riderParam === 'string' && riderParam.trim()) {
+    if (riderParam === 'unassigned') {
+      where.assignedRiderId = null;
+    } else {
+      const rIdNum = Number(riderParam);
+      if (Number.isInteger(rIdNum) && rIdNum > 0) {
+        where.assignedRiderId = rIdNum;
+      }
+    }
+  }
+
+  // Optional explicit shipper filter (CEO/Manager views only)
+  const shipperParam = shipperId ?? shipperFilter;
+  if (shipperParam && !['SHIPPER', 'RIDER'].includes(role)) {
+    const sIdNum = Number(shipperParam);
+    if (Number.isInteger(sIdNum) && sIdNum > 0) {
+      where.shipperId = sIdNum;
+    }
+  }
+
+  // Date range filter (createdAt)
+  if (from || to) {
+    const createdAt = {};
+    if (from) {
+      const d = new Date(from);
+      if (!Number.isNaN(d.getTime())) {
+        d.setHours(0, 0, 0, 0);
+        createdAt.gte = d;
+      }
+    }
+    if (to) {
+      const d = new Date(to);
+      if (!Number.isNaN(d.getTime())) {
+        d.setHours(23, 59, 59, 999);
+        createdAt.lte = d;
+      }
+    }
+    if (Object.keys(createdAt).length) {
+      where.createdAt = createdAt;
+    }
+  }
+
+  // Status or status group filter
+  const rawStatus = (statusGroup || status || '').toString().trim().toUpperCase();
+  if (rawStatus) {
+    const finalStatuses = ['DELIVERED', 'RETURNED', 'FAILED'];
+    if (finalStatuses.includes(rawStatus) ||
+        ['CREATED', 'ASSIGNED', 'AT_LLL_WAREHOUSE', 'OUT_FOR_DELIVERY'].includes(rawStatus)) {
+      where.status = rawStatus;
+    } else if (rawStatus === 'PENDING') {
+      where.status = { notIn: finalStatuses };
+    } else if (rawStatus === 'OUT_FOR_DELIVERY_GROUP') {
+      // For future use: group status could be handled with a more
+      // complex OR. For now we keep the simple equality behaviour
+      // used above.
+    }
+  }
+
+  // Search by tracking / booking / external order number. For
+  // exports we intentionally mirror the behaviour in getOrders
+  // where search overrides the visibility OR condition.
+  const searchValue = (q || search || '').toString().trim();
+  if (searchValue) {
+    where.OR = [
+      { trackingId: searchValue },
+      { bookingId: searchValue },
+      { sourceProviderOrderNumber: searchValue },
+    ];
+  }
+
+  return where;
 }
 
 /**
@@ -247,6 +361,107 @@ const getOrders = async (req, res, next) => {
     });
 
     res.json(orders.map(mapOrderToApi));
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Excel export for orders list (CEO, Manager).
+// Respects the same visibility rules as getOrders and applies
+// additional filters via query params (from, to, status, riderId,
+// shipperId, q/search).
+const exportOrdersReportXlsx = async (req, res, next) => {
+  try {
+    const role = req.user && req.user.role;
+
+    // Only CEO and Manager are allowed to export this report
+    if (!['CEO', 'MANAGER'].includes(role)) {
+      return res
+        .status(403)
+        .json({ message: 'You are not allowed to export orders report' });
+    }
+
+    const where = buildOrdersExportWhere(req.user, req.query);
+
+    const MAX_ROWS = 10000;
+
+    const orders = await prisma.order.findMany({
+      where,
+      include: {
+        shipper: {
+          select: {
+            name: true,
+            companyName: true,
+          },
+        },
+        assignedRider: {
+          select: {
+            name: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: MAX_ROWS,
+    });
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Orders');
+
+    // Columns mirror CEO/Manager Orders table, except we exclude:
+    // - source
+    // - booking
+    // - payment
+    // - actions
+    worksheet.columns = [
+      { header: 'Shipper', key: 'shipper', width: 32 },
+      { header: 'Order ID', key: 'orderId', width: 24 },
+      { header: 'Tracking ID', key: 'trackingId', width: 20 },
+      { header: 'Consignee', key: 'consignee', width: 28 },
+      { header: 'COD (PKR)', key: 'cod', width: 14 },
+      { header: 'Date (Created At)', key: 'date', width: 22 },
+      { header: 'Delivery Status', key: 'status', width: 18 },
+      { header: 'Rider', key: 'rider', width: 24 },
+    ];
+
+    orders.forEach((order) => {
+      const isIntegrated = !!order.isIntegrated;
+      const externalOrderNo =
+        order.sourceProviderOrderNumber || order.externalOrderId || order.bookingId;
+      const orderIdDisplay = isIntegrated ? externalOrderNo : order.bookingId;
+
+      const row = {
+        shipper:
+          order.shipper?.companyName || order.shipper?.name || 'Unknown Shipper',
+        orderId: orderIdDisplay,
+        trackingId: order.trackingId || '',
+        consignee: order.consigneeName || '',
+        destinationCity: order.destinationCity || '',
+        cod: Number(order.codAmount || 0),
+        date: order.createdAt
+          ? order.createdAt.toISOString().replace('T', ' ').slice(0, 19)
+          : '',
+        status: order.status || '',
+        rider: order.assignedRider?.name || '',
+      };
+
+      worksheet.addRow(row);
+    });
+
+    if (worksheet.rowCount > 0) {
+      worksheet.getRow(1).font = { bold: true };
+    }
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    );
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="orders-report.xlsx"',
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
   } catch (error) {
     next(error);
   }
@@ -1761,4 +1976,5 @@ module.exports = {
   getPendingIntegratedOrdersForShipper,
   rejectIntegratedOrder,
   ceoEditOrder,
+   exportOrdersReportXlsx,
 };

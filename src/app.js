@@ -114,6 +114,7 @@ app.use("/api/users", require("./routes/userRoutes"));
 app.use("/api/orders", require("./routes/orderRoutes"));
 app.use("/api/commission", require("./routes/commissionRoutes"));
 app.use("/api/finance", require("./routes/financeRoutes"));
+app.use("/api/reports", require("./routes/reportRoutes"));
 app.use("/api/shipper/finance", require("./routes/shipperFinanceRoutes"));
 app.use("/api/invoice", require("./routes/invoiceRoutes"));
 app.use("/api/integrations", require("./routes/integrationRoutes"));

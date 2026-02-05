@@ -19,7 +19,13 @@ router.post(
 
 // Read: All roles (filtered by controller)
 // Shipper portal is gated by requireCommissionApproved, riders by requireRiderCommissionConfigured
-router.get("/", requireCommissionApproved, requireRiderCommissionConfigured, orderController.getOrders);
+router.get(
+  "/",
+  requireCommissionApproved,
+  requireRiderCommissionConfigured,
+  orderController.getOrders,
+);
+
 router.get(
   "/summary/manager",
   requireRole("MANAGER"),
