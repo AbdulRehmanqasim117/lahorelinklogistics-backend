@@ -164,7 +164,15 @@ function buildOrdersExportWhere(user, query) {
         ['CREATED', 'ASSIGNED', 'AT_LLL_WAREHOUSE', 'OUT_FOR_DELIVERY'].includes(rawStatus)) {
       where.status = rawStatus;
     } else if (rawStatus === 'PENDING') {
-      where.status = { notIn: finalStatuses };
+      // For shippers, match the ShipperDashboard filter which treats
+      // PENDING as excluding out-for-delivery as well as final states.
+      if (role === 'SHIPPER') {
+        where.status = {
+          notIn: [...finalStatuses, 'OUT_FOR_DELIVERY'],
+        };
+      } else {
+        where.status = { notIn: finalStatuses };
+      }
     } else if (rawStatus === 'OUT_FOR_DELIVERY_GROUP') {
       // For future use: group status could be handled with a more
       // complex OR. For now we keep the simple equality behaviour
@@ -820,6 +828,144 @@ const ceoEditOrder = async (req, res, next) => {
     });
 
     res.json(mapOrderToApi(updated));
+  } catch (error) {
+    next(error);
+  }
+};
+
+const exportShipperOrdersReportXlsx = async (req, res, next) => {
+  try {
+    const user = req.user;
+
+    if (!user || user.role !== 'SHIPPER') {
+      return res
+        .status(403)
+        .json({ message: 'Only shippers can export their orders' });
+    }
+
+    const where = buildOrdersExportWhere(user, req.query || {});
+
+    const MAX_ROWS = 10000;
+
+    const orders = await prisma.order.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: MAX_ROWS,
+    });
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Orders');
+
+    // Shipper Orders table columns minus: source, booking, payment, actions, select
+    worksheet.columns = [
+      { header: 'Order ID', key: 'orderId', width: 24 },
+      { header: 'Tracking ID', key: 'trackingId', width: 20 },
+      { header: 'Consignee', key: 'consignee', width: 28 },
+      { header: 'COD (PKR)', key: 'cod', width: 14 },
+      { header: 'Date (Created At)', key: 'date', width: 22 },
+      { header: 'Delivery Status', key: 'status', width: 18 },
+    ];
+
+    orders.forEach((order) => {
+      const isIntegrated = !!order.isIntegrated;
+      const externalOrderNo =
+        order.shopifyOrderNumber ||
+        order.sourceProviderOrderNumber ||
+        order.externalOrderId ||
+        order.bookingId;
+      const orderIdDisplay = isIntegrated ? externalOrderNo : order.bookingId;
+
+      const row = {
+        orderId: orderIdDisplay,
+        trackingId: order.trackingId || '',
+        consignee: order.consigneeName || '',
+        cod: Number(order.codAmount || 0),
+        date: order.createdAt
+          ? order.createdAt.toISOString().replace('T', ' ').slice(0, 19)
+          : '',
+        status: order.status || '',
+      };
+
+      worksheet.addRow(row);
+    });
+
+    if (worksheet.rowCount > 0) {
+      worksheet.getRow(1).font = { bold: true };
+    }
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    );
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="shipper-orders-report.xlsx"',
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    next(error);
+  }
+};
+
+const softDeleteShipperOrder = async (req, res, next) => {
+  try {
+    const user = req.user;
+    if (!user || user.role !== 'SHIPPER') {
+      return res
+        .status(403)
+        .json({ message: 'Only shippers can delete their own orders' });
+    }
+
+    const rawId = req.params.id;
+    const orderId = Number(rawId);
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      return res.status(400).json({ message: 'Invalid order id' });
+    }
+
+    const shipperIdNum = Number(user.id);
+    if (!Number.isInteger(shipperIdNum) || shipperIdNum <= 0) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const order = await prisma.order.findFirst({
+      where: {
+        id: orderId,
+        shipperId: shipperIdNum,
+        isDeleted: false,
+      },
+    });
+
+    if (!order) {
+      return res
+        .status(404)
+        .json({ message: 'Order not found or already deleted' });
+    }
+
+    const forbiddenStatuses = [
+      'DELIVERED',
+      'RETURNED',
+      'FAILED',
+      'OUT_FOR_DELIVERY',
+      'AT_LLL_WAREHOUSE',
+    ];
+
+    if (forbiddenStatuses.includes(order.status)) {
+      return res.status(400).json({
+        message:
+          'You cannot delete an order that is delivered, returned, failed or out for delivery / in warehouse.',
+      });
+    }
+
+    await prisma.order.update({
+      where: { id: orderId },
+      data: {
+        isDeleted: true,
+      },
+    });
+
+    return res.json({ message: 'Order deleted successfully' });
   } catch (error) {
     next(error);
   }
@@ -1976,5 +2122,7 @@ module.exports = {
   getPendingIntegratedOrdersForShipper,
   rejectIntegratedOrder,
   ceoEditOrder,
-   exportOrdersReportXlsx,
+  exportOrdersReportXlsx,
+  exportShipperOrdersReportXlsx,
+  softDeleteShipperOrder,
 };

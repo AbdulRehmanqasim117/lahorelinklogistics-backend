@@ -121,8 +121,42 @@ exports.listShipperIntegratedOrders = async (req, res, next) => {
     if (!Number.isInteger(shipperId) || shipperId <= 0)
       return sendError(res, 401, 'Unauthorized');
 
+    const { cityFilter } = req.query || {};
+
+    const baseWhere = { shipperId, provider: 'SHOPIFY' };
+    let where = baseWhere;
+
+    const normalizedCityFilter =
+      typeof cityFilter === 'string' ? cityFilter.toLowerCase() : '';
+
+    if (normalizedCityFilter === 'lahore') {
+      // Lahore filter: only cities that clearly mention Lahore (case-insensitive)
+      where = {
+        ...baseWhere,
+        city: {
+          contains: 'lahore',
+          mode: 'insensitive',
+        },
+      };
+    } else if (normalizedCityFilter === 'others') {
+      // Others: non-empty cities that do NOT mention Lahore
+      where = {
+        ...baseWhere,
+        NOT: [
+          { city: null },
+          { city: '' },
+          {
+            city: {
+              contains: 'lahore',
+              mode: 'insensitive',
+            },
+          },
+        ],
+      };
+    }
+
     const orders = await prisma.integratedOrder.findMany({
-      where: { shipperId, provider: 'SHOPIFY' },
+      where,
       orderBy: { createdAt: 'desc' },
     });
 
