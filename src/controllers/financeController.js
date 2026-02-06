@@ -480,7 +480,10 @@ exports.getMyRiderSummary = async (req, res, next) => {
     const totals = transactions.reduce(
       (acc, t) => {
         const cod = Number(t.totalCodCollected || 0);
-        acc.totalCodCollected += cod;
+        const effectiveStatus = String(t.order?.status || '').toUpperCase();
+        if (effectiveStatus === 'DELIVERED') {
+          acc.totalCodCollected += cod;
+        }
 
         const createdDate = t.createdAt
           ? new Date(t.createdAt).toDateString()
@@ -490,7 +493,10 @@ exports.getMyRiderSummary = async (req, res, next) => {
         }
 
         const st = String(t.settlementStatus || '').toUpperCase();
-        if (['UNPAID', 'PENDING'].includes(st)) acc.pendingCount += 1;
+        if (['UNPAID', 'PENDING'].includes(st)) {
+          acc.pendingCount += 1;
+          acc.unpaidBalance += Number(t.riderCommission || 0);
+        }
         if (['PAID', 'SETTLED'].includes(st)) acc.settledCount += 1;
 
         return acc;
@@ -500,6 +506,7 @@ exports.getMyRiderSummary = async (req, res, next) => {
         todayCodCollected: 0,
         pendingCount: 0,
         settledCount: 0,
+        unpaidBalance: 0,
       },
     );
 
